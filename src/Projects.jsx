@@ -967,846 +967,878 @@ const TIER_LABELS = {
 const DEEP_DIVES = {
   'traffic-replay': {
     framing:
-      'This is the project most likely to be probed at staff level because it touches every hard problem at once: distributed systems, security, data parity, observability, blast radius, performance. Be ready for chains, not isolated questions.',
+      'The most-probed project at staff level. Architecture is well-documented internally; be ready for chains on capture/security/data-parity/blast-radius. All war-story content below is documented failure modes designed for, not incidents you should claim happened unless you remember them specifically.',
     decisions: [
       {
-        q: 'Where to capture traffic — in-process middleware, sidecar, or service-mesh mirror?',
+        q: 'Where to capture traffic — in-process middleware vs sidecar?',
         options: [
           'In-process middleware: lowest overhead, full request context.',
-          'Sidecar with GoReplay: zero application coupling, independent lifecycle.',
-          'Service-mesh (Envoy) mirror: leverages existing mesh, no new component.',
+          'Sidecar container with GoReplay: zero application coupling, independent lifecycle.',
         ],
         chosen: 'Sidecar with GoReplay.',
-        why: 'The monolith was 1.8M LOC with no mesh and limited willingness to change application code for non-functional concerns. Sidecar gave a separate failure domain, independent rollout, and zero risk of latency regressions in critical paths.',
-        tradeoff: 'Extra ~10% CPU/memory per pod and a network hop. Accepted because the alternative (in-process) couples capture lifecycle to release lifecycle, and Envoy mirror was not available in the production cluster.',
+        why: 'Zero application code changes. Independent rollout. Separate failure domain. Setup as a reusable Docker image with a few configurations across services. ~10% additional CPU/memory overhead measured in production.',
+        tradeoff: 'Extra container resources and a network hop. Accepted because the alternative (in-process) couples capture lifecycle to release lifecycle.',
       },
       {
-        q: 'Why GoReplay specifically over tcpreplay, custom packet capture, or Envoy tap?',
+        q: 'TLS handling — terminate at LB or inside the pod?',
         options: [
-          'tcpreplay (L4): replays packets, not requests — loses HTTP semantics.',
-          'Custom packet capture: full control, but reinvents a mature tool.',
-          'GoReplay: HTTP-aware, mature, configurable filters, low overhead.',
-        ],
-        chosen: 'GoReplay.',
-        why: 'HTTP-aware capture lets us filter by endpoint, partition by transaction ID, and replay against a different host trivially. Maturity reduced operational risk for a production-adjacent component.',
-        tradeoff: 'Requires TLS termination inside the pod to capture plaintext. We accepted the Nginx-sandwich complexity for HTTP-level fidelity.',
-      },
-      {
-        q: 'TLS handling — terminate at LB, terminate at sidecar, or capture encrypted?',
-        options: [
-          'Terminate at load balancer: simple, but plaintext crosses internal network.',
-          'Sandwich inside pod (Nginx1 → GoReplay → Nginx2 → app): plaintext never leaves the pod.',
-          'Capture encrypted + offline decryption: highest security, lowest fidelity, no real-time validation.',
+          'Terminate at LB: simple, plaintext crosses internal network.',
+          'In-pod Nginx sandwich: Nginx1 SSL-offloads, GoReplay captures plaintext, Nginx2 re-encrypts before app.',
         ],
         chosen: 'In-pod Nginx sandwich.',
-        why: 'Plaintext is contained within the pod boundary. GoReplay sees decrypted HTTP for accurate parsing. The second Nginx re-encrypts (optional in some envs) before the app, preserving the contract that the app receives the same traffic shape.',
-        tradeoff: 'Two Nginx instances per pod, more config surface. Accepted because security + fidelity were both first-class.',
+        why: 'GoReplay is HTTP-aware and needs decrypted traffic. The sandwich keeps plaintext inside the pod, with Nginx1 doing SSL offload and Nginx2 (optional) re-encrypting before the application.',
+        tradeoff: 'Two Nginx instances per pod and more config surface. Accepted because HTTP-level fidelity and in-pod security were both required.',
       },
       {
-        q: 'Bus partitioning — by tenant_id, by timestamp, or by transaction_id?',
+        q: 'Bus partitioning — what is the partition key?',
         options: [
-          'tenant_id: groups all tenant traffic together, but loses request/response co-location.',
-          'timestamp: distributes evenly, but breaks ordering for related events.',
-          'transaction_id: guarantees request and response land on the same partition in order.',
+          'tenant_id: groups by tenant but loses request/response co-location.',
+          'transaction_id: guarantees request and response land on the same partition.',
         ],
         chosen: 'transaction_id as partition key.',
-        why: 'A validator consumer must always see request followed by its response. Using transaction_id guarantees this without coordination logic on the consumer side. Workflows that span multiple requests are correlated upstream and propagate the same transaction_id, preserving locality.',
-        tradeoff: 'Requires upstream services to generate consistent transaction IDs. We standardized on a header (X-Transaction-Id) and added middleware to generate one if absent.',
+        why: 'Request and response for the same transaction must be paired by the validator. Same-partition placement makes pairing trivial without coordination logic on the consumer.',
+        tradeoff: 'Requires consistent transaction_id propagation. Standardized as request metadata along with timestamp.',
       },
       {
-        q: 'Downstream write handling — allow real writes, idempotent retries, or mock everything?',
+        q: 'Downstream write handling — allow real writes or mock?',
         options: [
-          'Allow real writes: true e2e validation, but doubles downstream traffic and requires idempotent downstreams.',
-          'Idempotent retries: relies on every downstream being idempotent — none of them are guaranteed to be.',
-          'Mock at Envoy + Wiremock: zero blast radius, sacrifices true e2e behavior.',
+          'Allow real writes: true e2e validation, doubles downstream traffic.',
+          'Envoy + Wiremock mock: zero blast radius, sacrifices true downstream e2e.',
         ],
-        chosen: 'Mock at Envoy + Wiremock.',
-        why: 'Downstreams could not commit to idempotency, and doubling their traffic would violate their SLAs. Mocking bounds blast radius to zero — the parallel server can never touch external state — and we still get response/data/perf parity for the upstream surface.',
-        tradeoff: 'Cannot validate the true downstream side-effect chain. We accepted this because the alternative (corrupting downstream production state) is unacceptable. True e2e is validated separately in non-prod.',
+        chosen: 'Envoy + Wiremock mock at sidecar.',
+        why: 'Envoy proxies all outbound traffic from the parallel pod; based on configured rules it either allows, blocks, or reroutes downstream calls to Wiremock, which serves dynamic dummy responses. Blast radius is zero by construction — the parallel server cannot touch external state.',
+        tradeoff: 'Cannot validate true downstream side-effect chains. Acceptable because corrupting downstream production is unacceptable; e2e validated separately in non-prod.',
       },
       {
-        q: 'Data validation algorithm — full diff, sampled diff, or workflow-scoped graph traversal?',
+        q: 'Data validation algorithm — full diff or workflow-scoped?',
         options: [
-          'Full-table diff: correct but O(table size); infeasible at TB scale.',
-          'Sampled diff: misses low-frequency mismatches.',
-          'Workflow-scoped BFS over FK graph, bounded by tenant + time window.',
+          'Full-table diff: correct but O(table size); infeasible at scale.',
+          'Workflow-scoped BFS over FK graph, bounded by tenant + parent record + time window.',
         ],
         chosen: 'Workflow-scoped BFS.',
-        why: 'A write workflow touches a known, bounded set of tables. Per-workflow config encodes the impacted tables; BFS traverses from tenant_id + parent_record_id within a bounded time window. Cost is O(impacted rows), not O(table).',
-        tradeoff: 'Requires accurate workflow→tables mapping config. Drift in this config = silent validation gaps. Mitigated by config review on every new workflow and a periodic table-coverage audit.',
+        why: 'Replay Validator Middleware maintains per-workflow config of impacted tables. Starting from tenant_id and parent_record_id, BFS traverses FK relationships within a bounded time window. Variable fields (Id, Timestamp, etc.) are intelligently ignored. Results logged to Splunk/ELK for analysis.',
+        tradeoff: 'Requires accurate workflow→tables mapping config per write workflow.',
       },
       {
-        q: 'Replay rate — sync 1×, async 1×, or async with variable speed (0.5×/2×/3×)?',
+        q: 'Replay rate — fixed 1× or variable speed (0.5×/2×/3×)?',
         options: [
-          'Sync 1×: easiest correctness reasoning, but couples validator perf to prod.',
-          'Async 1×: decouples, but cannot stress test.',
-          'Async variable: decouples + enables stability testing under peak.',
+          'Sync 1×: easiest correctness, couples validator perf to prod.',
+          'Async variable: decoupled, enables stability testing under peak.',
         ],
-        chosen: 'Async with variable speed.',
-        why: 'Critical for the Oracle Exit and Hibernate Upgrade initiatives — needed to validate behavior at 3× peak before FY peak hit production. Decoupling capture from replay rate lets the validator catch up or run faster independently.',
-        tradeoff: 'Validation lag — mismatches surface seconds-to-minutes after the request. Acceptable for non-real-time validation.',
+        chosen: 'Async with 0.5×/2×/3× replay support.',
+        why: 'Replay Validator Middleware stores requests/responses for replay at variable speeds. Particularly useful for assessing system stability during peak traffic scenarios. Used during Hibernate upgrade and Oracle Exit to validate behavior before FY peak.',
+        tradeoff: 'Validation lag — mismatches surface seconds to minutes after the request. Acceptable for non-real-time validation.',
       },
     ],
     algorithms: [
       {
-        name: 'Response normalization',
+        name: 'Workflow-scoped BFS over FK graph',
         description:
-          'Before comparison, both responses pass through a normalizer: skip variable headers (X-Request-Id, Date, Set-Cookie), normalize JSON (sort object keys, treat arrays representing sets as unordered), apply numeric tolerance (1e-6 for floats), and ignore fields registered in the per-workflow ignore list (IDs, timestamps, generated tokens).',
-        complexity: 'O(response size) per comparison.',
-        why: 'Without this, ~30% of comparisons were false positives in the early prototype. Normalization is the difference between a usable tool and a noise generator.',
-      },
-      {
-        name: 'BFS data validation',
-        description:
-          'For a given write workflow: (1) lookup impacted tables from config, (2) start BFS from tenant_id + parent_record_id, (3) traverse FK edges in both DBs, (4) collect rows within bounded time window (request_timestamp ± Δ), (5) diff resulting row sets with normalization (ignore IDs, timestamps, audit columns).',
+          'Per write workflow, lookup impacted tables from config. Starting at tenant_id and parent_record_id, traverse FK edges in both active and parallel DBs within a bounded time window. Compare resulting row sets with variable fields (Id, Timestamp) ignored.',
         complexity: 'O(impacted rows × avg row size) per workflow execution.',
-        why: 'Full-table diff is infeasible at TB scale and full-row diff is noisy. Scoping by tenant + parent_record + time window gives bounded, deterministic, semantically meaningful comparison.',
+        why: 'Full-table diff is infeasible at TB scale. Scoping by tenant + parent_record + time window gives bounded, semantically meaningful comparison.',
       },
       {
-        name: 'Performance bucketing (TP90/TP95/TP99)',
+        name: 'Response normalization with variable-field ignore',
         description:
-          'Per workflow, response times tracked in a sliding window. Percentiles computed using t-digest for efficient streaming aggregation. Anomalies surfaced via z-score on a rolling baseline (last N hours).',
-        complexity: 'O(log N) insert into t-digest, O(1) percentile query.',
-        why: 'Naive percentile (sort and pick) is O(N log N) per query and infeasible at our request volume. t-digest gives accurate tail percentiles at low memory cost.',
+          'Before comparing active vs parallel responses, normalize: skip variable headers and fields (timestamps, generated IDs, transaction metadata). Per-workflow ignore config can be extended for known-divergent fields.',
+        complexity: 'O(response size) per comparison.',
+        why: 'Without normalization, every response would diff on timestamps and generated IDs. Normalization is required for the validator to produce signal instead of noise.',
+      },
+      {
+        name: 'Correlation via transaction_id',
+        description:
+          'Request and response correlated through transaction_id propagated via request metadata. Both stored together on the same bus partition. Validator pairs them for response, data, and performance comparison.',
+        complexity: 'O(1) pairing per transaction.',
+        why: 'Without correlation, async pairing requires coordination logic. Same-partition placement eliminates the coordination problem.',
       },
     ],
     numbers: [
-      { metric: 'Sidecar overhead', value: '~10% CPU & memory', note: 'Measured under peak production load. Capture + forwarding both async to keep request path latency unchanged.' },
-      { metric: 'Total requests replayed', value: '300M+', note: 'Across the lifetime of the framework, peak day ~3M.' },
-      { metric: 'Load multiplier supported', value: '0.5× / 2× / 3×', note: 'Used for stress testing before FY peak.' },
-      { metric: 'Functional issues caught', value: '20+', note: 'Before customer impact, primarily during Oracle Exit.' },
-      { metric: 'Performance issues caught', value: '30+', note: 'TP90/95/99 regressions surfaced per workflow.' },
+      { metric: 'Sidecar resource overhead', value: '~10% CPU & memory', note: 'Documented in setup specs. No service deterioration of production server.' },
+      { metric: 'Traffic replicated', value: '1M+ requests/day', note: 'Supports HTTP, REST, GraphQL, SOAP, RPC. Extensible to non-HTTP.' },
+      { metric: 'Replay speeds supported', value: '0.5× / 2× / 3×', note: 'Used for stress testing system stability before peak periods.' },
       { metric: 'Manual regression hours saved', value: '1000+', note: 'Org-wide across initiatives.' },
-      { metric: 'Hibernate upgrade hours saved', value: '200+', note: 'Single initiative; framework was primary validation tool.' },
-      { metric: 'Smooth releases enabled', value: '70+', note: 'Oracle Exit initiative, zero P0/P1.' },
+      { metric: 'Smooth Oracle Exit releases', value: '70+', note: '32 TB Oracle migration initiative; 0 P0/P1 issues.' },
+      { metric: 'Hibernate upgrade hours saved', value: '200+', note: 'Hibernate 3.x → 5.x upgrade, validated using the framework before FY23 peak. 0 P0/P1.' },
+      { metric: 'Sidecar listen port / forward port', value: '9443 → 8443', note: 'Sidecar intercepts inbound on 9443, forwards customer traffic to 8443.' },
     ],
     warStories: [
       {
-        scenario: 'Validator CPU saturation at 3× replay',
+        scenario: 'False positives from variable fields in responses',
         whatHappened:
-          'During the first 3× load test, validator pods OOM-ed and CPU saturated within minutes. Replay backlog exploded; comparisons stalled.',
+          'Responses contain timestamps, generated IDs, and metadata that differ between active and parallel runs by design. Without normalization, every comparison would flag mismatch.',
         howResolved:
-          'Two fixes in sequence: (1) horizontally scaled consumers from 2 to 8 pods, partitioned by transaction_id hash; (2) optimized the JSON diff hot path — switched from a recursive object walk to a streaming structural diff. CPU dropped ~60% per pod.',
+          'Validator intelligently ignores variable fields like Id, Timestamp, and similar. Per-workflow ignore config extensible for new known-divergent fields. Comparison results logged to Splunk/ELK with categorization.',
         lesson:
-          'Assume the validator is the bottleneck before the bus or storage. The bus is built for throughput; bespoke validator code is where naive implementations bite.',
+          'Normalization is a first-class feature in any comparison-based validator. The default mode must be to ignore known-noisy fields.',
       },
       {
-        scenario: '30% false positive flood on first prototype',
+        scenario: 'Downstream calls during replay',
         whatHappened:
-          'Initial response comparison flagged ~30% of replays as mismatched. Investigation showed timestamps, generated IDs, and X-Request-Id headers differing by design.',
+          'Replaying write workflows would trigger real downstream calls (Notification service, payment processors, etc.) and double their traffic — violating their SLAs and corrupting their state.',
         howResolved:
-          'Built a per-workflow field-ignore registry. Added semantic JSON diff (sort keys, set semantics for unordered arrays, numeric tolerance). Surfaced still-failing mismatches in Splunk dashboards with categorization (ignored / acknowledged / real). False positive rate dropped to <2%.',
+          'Envoy sidecar in staging deployment pods captures all outbound traffic. Based on rules, allows / blocks / reroutes downstream calls to Wiremock, which returns dummy responses. Parallel server cannot reach external state.',
         lesson:
-          'Normalization is a first-class feature. Without it the tool is unusable — noise drowns signal.',
+          'Any external side effect — call, write, event — must be mocked at the network boundary for blast radius to be zero by construction, not by convention.',
       },
       {
-        scenario: 'Stale cloned database during long replay window',
+        scenario: 'TLS-encrypted traffic capture',
         whatHappened:
-          'During a multi-hour replay run, the cloned DB (refreshed weekly) drifted from production state. Data validation flagged drift mismatches as failures.',
+          'Production traffic is HTTPS; GoReplay needs HTTP-level visibility to capture endpoint, body, headers. Naive capture from outside the pod would either lose semantics (L4) or expose plaintext on the network.',
         howResolved:
-          'Bounded the data comparison time window strictly to the request timestamp ± Δ. Made FK traversal time-window-aware. Surfaced drift outside the window separately as informational, not failure.',
+          'Nginx1 inside the pod terminates TLS. GoReplay captures decrypted traffic. Nginx2 (optional) re-encrypts before forwarding to the application. Plaintext is contained within the pod boundary.',
         lesson:
-          'Data parity is time-sensitive, not absolute. The framework must understand that production moves forward during validation.',
-      },
-      {
-        scenario: 'Outbox events re-published from parallel server',
-        whatHappened:
-          'In an early version, the parallel server processed write workflows and triggered outbox inserts. Those inserts got CDC-published to consumers, causing duplicate downstream events.',
-        howResolved:
-          'Added outbox-write mocking to the Wiremock config on the parallel server. Outbox table writes intercepted and dropped. Verified via consumer-side dedup metrics.',
-        lesson:
-          'Any side effect — direct write, event, notification — must be mocked. "Downstream calls" is too narrow a definition.',
-      },
-      {
-        scenario: 'Encryption key rotation mid-replay',
-        whatHappened:
-          'IDPS key rotated while replay middleware had in-flight messages encrypted with the old key. Validator started failing to decrypt.',
-        howResolved:
-          'Added graceful fallback: try current key, then previous key, then skip with alert. Updated key rotation runbook to include validator restart timing.',
-        lesson:
-          'Stateful crypto + async pipelines need explicit key-version handling. Don\'t assume rotation is instantaneous.',
+          'Security boundaries should be physical (pod-level), not logical. In-pod TLS termination preserves both fidelity and isolation.',
       },
     ],
     edgeCases: [
-      { case: 'Long-running requests (>30s)', handling: 'Transaction_id partition still guarantees pairing. Validator has a configurable timeout per workflow; on timeout, marked as inconclusive, not mismatch.' },
-      { case: 'Out-of-order responses in same partition', handling: 'Bus guarantees ordering per partition. If misordering still observed (rare bus issue), correlation via transaction_id covers it — pairing logic does not depend on adjacency.' },
-      { case: 'Workflow version mismatch (newer code in parallel)', handling: 'Expected when validating refactors. Surfaced as warning, not error. Per-workflow config has an "allow-divergence" flag for known-divergent fields.' },
-      { case: 'Tenant in-flight migration', handling: 'Tenants undergoing data migrations are excluded from data validation via a tenant block list. Functional + performance validation continues.' },
-      { case: 'Replay validator pod crash mid-batch', handling: 'Messages remain on bus, reprocessed on consumer restart. At-least-once delivery + idempotent validation (re-running produces same result).' },
+      { case: 'Variable fields in responses (Id, Timestamp, etc.)', handling: 'Intelligently ignored by the validator. Per-workflow ignore-field config extensible.' },
+      { case: 'Long-running workflows spanning multiple requests', handling: 'transaction_id propagates across requests, keeping all related events on the same partition.' },
+      { case: 'Encrypted traffic at rest', handling: 'Request, response, and metadata encrypted before forwarding to the messaging system. Data secure at rest.' },
+      { case: 'Active server performance impact', handling: 'Sidecar overhead held to ~10% CPU/memory. Capture and forwarding async to minimize impact on active request path.' },
+      { case: 'Non-HTTP protocols', handling: 'Architecture extensible to non-HTTP per docs; current support covers HTTP/HTTPS with REST/GraphQL/SOAP/RPC.' },
     ],
     whatIWouldChange:
-      'Three things. (1) Multi-tenant middleware from day one — we duplicated infra per team and paid ~30% extra cost retrospectively. (2) A diff visualization layer with categorized common mismatches and auto-suggested ignore-registry entries — onboarding new workflows took longer than it should have. (3) Streaming capture instead of full request body persistence — storage costs scaled poorly. Worth it for the wins, but expensive.',
+      'Anything here is your retrospective opinion, not from your docs. Sample candidates to consider (mark as your view): multi-tenant middleware to reduce per-team infra duplication; better self-serve onboarding to reduce time-to-value for new services; streaming capture to reduce storage costs. Verify before claiming.',
     chains: [
       {
-        title: 'The TLS / capture-layer chain',
+        title: 'The capture-architecture chain',
         steps: [
-          { q: 'Why sidecar, not in-process?', a: 'Zero coupling to app lifecycle, independent rollout, separate failure domain.' },
-          { q: 'How do you handle HTTPS?', a: 'Nginx terminates TLS inside the pod, GoReplay captures plaintext, Nginx re-encrypts to the app.' },
-          { q: 'Why not capture encrypted and decrypt offline?', a: 'Loses real-time validation. We accepted in-pod plaintext because the pod is the security boundary anyway.' },
-          { q: 'What\'s the actual overhead?', a: '~10% CPU and memory under peak. Async forwarding keeps request latency unchanged.' },
-          { q: 'How did you measure it?', a: 'A/B comparison: cluster with sidecar vs without, identical traffic, p95 and p99 latency tracked. Resource via Prometheus.' },
+          { q: 'Why sidecar instead of in-process middleware?', a: 'Zero coupling to app lifecycle, independent rollout, separate failure domain, no application code changes.' },
+          { q: 'How do you handle HTTPS?', a: 'Nginx1 terminates TLS inside the pod, GoReplay captures plaintext, Nginx2 (optional) re-encrypts before the app receives it.' },
+          { q: 'Why two Nginx instances?', a: 'GoReplay needs HTTP-level visibility, which requires plaintext. Sandwich keeps plaintext inside the pod boundary.' },
+          { q: 'What is the actual production overhead?', a: '~10% CPU and memory documented in setup. No service deterioration observed.' },
+          { q: 'How does the sidecar avoid impacting customer requests?', a: 'Sidecar listens on 9443, intercepts inbound, forwards customer traffic to 8443. Capture and forwarding are async so the request path is unblocked.' },
         ],
       },
       {
         title: 'The data-parity correctness chain',
         steps: [
-          { q: 'How do you compare data across two DBs?', a: 'BFS over FK relationships from tenant_id + parent_record, scoped by time window, with field normalization.' },
-          { q: 'How do you know your ignore-list isn\'t hiding real bugs?', a: 'Ignored fields are reviewed per workflow. Anything not on the list flags. Periodic audit compares the list against schema changes.' },
-          { q: 'What about eventual consistency between the two DBs?', a: 'Time-window bound. Compare within request_timestamp ± Δ. Drift outside the window is reported separately as informational.' },
-          { q: 'What if the cloned DB has stale data?', a: 'Weekly refresh; bounded comparison window keeps stale-vs-prod drift outside scope of failure-class mismatches.' },
-          { q: 'Can you prove a clean validation run is actually clean?', a: 'Sampling-based audit: a subset of "clean" workflows manually inspected. False-negative rate held below 1%.' },
+          { q: 'How do you compare data across two databases at production scale?', a: 'BFS over FK relationships from tenant_id and parent_record_id, scoped by time window. Per-workflow config defines impacted tables. Variable fields ignored.' },
+          { q: 'Why graph-based instead of full-table diff?', a: 'Full-table diff is O(table size). Workflow-scoped BFS is O(impacted rows) and semantically meaningful.' },
+          { q: 'How do you handle non-deterministic fields?', a: 'Variable fields (Id, Timestamp, generated metadata) ignored by default. Ignore list extensible per workflow.' },
+          { q: 'Where do results go?', a: 'Splunk/ELK with categorization. Deeper analysis via dashboards.' },
         ],
       },
       {
         title: 'The blast-radius chain',
         steps: [
-          { q: 'What happens if the replay system goes down?', a: 'Nothing customer-facing. Production traffic unaffected, validation coverage drops temporarily.' },
-          { q: 'What if a replay corrupts downstream?', a: 'Cannot happen by design. All downstream writes are mocked at Envoy + Wiremock. Reads pass through.' },
-          { q: 'What\'s the worst-case failure?', a: 'Missing a regression. The framework is passive — it can fail to catch, never cause.' },
-          { q: 'Could the parallel server be misconfigured to write to prod?', a: 'In theory yes. Config is gated by deployment review + a startup check that asserts mock mode. Two-person review on infra changes.' },
+          { q: 'What happens if the replay system goes down?', a: 'Nothing customer-facing. Production traffic continues unaffected; only validation coverage drops temporarily.' },
+          { q: 'How do you guarantee zero impact to downstreams?', a: 'Envoy + Wiremock at the parallel pod boundary. All outbound calls captured; mocks return dummy responses. Parallel server cannot reach external state.' },
+          { q: 'What is the worst-case failure of the framework itself?', a: 'Missing a regression. The framework is passive — it can fail to catch issues, never cause them.' },
+          { q: 'How is the parallel server\'s mock config protected from misconfiguration?', a: 'Mock config is part of the sidecar setup, gated by deployment review. The parallel server has no path to production downstreams by design.' },
         ],
       },
     ],
   },
   'mysql-postgres': {
     framing:
-      'Migrations are evaluated on three axes: correctness, rollback safety, and operational discipline. Be ready for each.',
+      'Heavily documented internally with FMEAs and risk register. Interviewers will probe decision rationale, parity strategy, and rollback. All numbers and migration files referenced below are from your docs.',
     decisions: [
       {
         q: 'Direct migration vs staged via MySQL 8?',
         options: [
-          'Staged (5.7 → 8.0 → Postgres): incremental risk, familiar intermediate.',
+          'Staged (5.7 → 8.0 → Postgres): two cutovers, two parity efforts, MySQL 8 licensing interim.',
           'Direct (5.7 → Postgres): single effort, immediate Postgres benefits.',
         ],
         chosen: 'Direct.',
-        why: 'Staged means two cutovers, two parity efforts, MySQL 8 licensing interim, dual-system overhead, and delayed Postgres benefits. Decision matrix scored Direct higher on cost, time-to-value, complexity, and disruption.',
-        tradeoff: 'Larger one-time risk surface. Bought down with three parity layers (DB, traffic replay, data lake) and rollback cluster ready at all times.',
+        why: 'Single effort eliminates a second migration and months of dual-operational complexity. Decision matrix evaluated cost, time-to-value, complexity, and business disruption. Three-cluster topology with reverse DMS provides rollback safety.',
+        tradeoff: 'Larger one-time risk surface. Bigger feature gap, more extensive testing. Bought down with three parity layers (DB, traffic replay, data lake) and rollback cluster.',
       },
       {
         q: 'Aurora Postgres vs RDS Postgres vs Aurora Serverless v2?',
         options: [
-          'RDS Postgres: compatible, manual scaling, slower failover.',
+          'RDS Postgres: standard, slower failover.',
           'Aurora Serverless v2: auto-scaling, variable cost.',
           'Aurora Postgres provisioned: highest performance, predictable cost.',
         ],
         chosen: 'Aurora Postgres provisioned.',
-        why: 'Team knew Aurora from MySQL Aurora — shared storage, fast clones, backtrack. Enterprise-grade for mission-critical workloads. Predictable cost at sustained load.',
-        tradeoff: 'Manual compute scaling. Acceptable because workload is predictable.',
+        why: 'Lowest-risk choice due to platform familiarity (team knew Aurora from MySQL Aurora) and predictable scale behavior. Driven by decision matrix.',
+        tradeoff: 'Manual compute scaling vs Serverless auto-scale. Acceptable because workload is predictable.',
       },
       {
-        q: 'Three-cluster topology — overkill or necessary?',
+        q: 'Three-cluster topology — necessary?',
         options: [
-          'Two clusters (A live, B target, no rollback): simpler but no fast rollback.',
-          'Three clusters (A → B → C) with reverse DMS ready.',
+          'Two clusters (A → B): no rollback.',
+          'Three clusters (A → B → C): C is MySQL 5.7 rollback cluster replicating from B, with A as last-resort fallback.',
         ],
         chosen: 'Three clusters.',
-        why: 'Blast radius of failed cutover on $270B/year platform is unacceptable. Cluster C with reverse DMS gives tested, ready-to-execute rollback in minutes, not days.',
-        tradeoff: 'Extra infra cost during cutover. Decommissioned post-bake. Worth the optionality.',
+        why: 'Cluster C is the rollback cluster for Postgres failure; replicates from Cluster B. Cluster A remains the last-resort rollback if B→A replication fails.',
+        tradeoff: 'Extra infra during cutover. Decommissioned post-bake. Money traded for rollback optionality.',
       },
       {
-        q: 'Collation handling — query-level LOWER() vs DB-level ICU collation?',
+        q: 'Collation for case-insensitive matching — query-level vs DB-level?',
         options: [
-          'Query-level LOWER(): touches every HQL query.',
-          'Application-level normalization: business logic owns it.',
-          'DB-level ICU non-deterministic collation matching MySQL utf8_general_ci.',
+          'Query level: LOWER() in HQL, touches every query.',
+          'Application level: normalize before querying.',
+          'DB level: ICU non-deterministic collation matching MySQL utf8_general_ci.',
         ],
         chosen: 'DB-level ICU collation.',
-        why: 'Zero query changes, indexes still work, native comparison perf. Matches MySQL semantics exactly without auditing every WHERE clause. Single migration applies; rollback trivial.',
-        tradeoff: 'Non-deterministic collation slight perf overhead vs deterministic. Acceptable alternative was hundreds of query changes.',
+        why: 'CREATE COLLATION case_insensitive (provider = icu, locale = \'und-u-ks-level2\', deterministic = false), applied via ALTER TABLE. Matches MySQL utf8_general_ci semantics with zero query changes.',
+        tradeoff: 'Non-deterministic collation has slight perf overhead vs deterministic. Acceptable; alternative was auditing hundreds of queries.',
       },
       {
-        q: 'Outbox handling — replicate via DMS, or set up Postgres outbox independently?',
+        q: 'AUTO_INCREMENT → BIGSERIAL handoff?',
+        options: [
+          'Let Hibernate handle: variable behavior.',
+          'GenerationType.IDENTITY + use-new-id-generator-mappings: false + sequence sync post-load.',
+        ],
+        chosen: 'GenerationType.IDENTITY + setval() post-load.',
+        why: 'Hibernate abstracts the engine difference. Post-DMS-load, run SELECT setval(\'<seq>\', COALESCE((SELECT MAX(id) FROM <table>), 1)) for every sequence to align with existing data.',
+        tradeoff: 'Sequence sync step must be in the cutover runbook; missing it causes duplicate-key on first insert.',
+      },
+      {
+        q: 'JSON column handling?',
+        options: [
+          'Native JSON type: differs MySQL vs Postgres in operators and Hibernate behavior.',
+          'PostgreSQLJsonType custom Hibernate UserType for jsonb.',
+        ],
+        chosen: 'PostgreSQLJsonType implementing Hibernate UserType.',
+        why: 'Entity annotated with @TypeDef(name="pgsql_json", typeClass=PostgreSQLJsonType.class). Handles serialization/deserialization consistently. No MySQL-specific JSON functions (JSON_EXTRACT etc.) found in queries, so query layer was clean.',
+        tradeoff: 'Custom type code to maintain. Necessary because generic ORM behavior on JSON conversion is unpredictable.',
+      },
+      {
+        q: 'Outbox during cutover?',
         options: [
           'Replicate outbox via DMS: simple, but events re-publish to consumers.',
           'Independent Postgres outbox with temp Kafka topics during parity, switch at cutover.',
         ],
         chosen: 'Independent outbox with temp topics.',
-        why: 'Replicating outbox would cause CDC consumers to see duplicate events during parity — broken ordering, broken idempotency. Temp topics isolated parallel-server events. Cutover: drain MySQL outbox, stop forward DMS, switch to original topics.',
-        tradeoff: 'Temp topic infra during parity. Required Outbox + UIP team coordination.',
+        why: 'Replicating outbox would cause CDC consumers to see duplicate events during parity. Temp topics isolate parallel-server events during validation. At cutover: drain MySQL outbox, stop forward DMS, switch outbox publishing to original topics.',
+        tradeoff: 'Temp topic infrastructure during parity phase. Required coordination with Outbox + UIP teams.',
       },
       {
-        q: 'Why one-shot cutover vs incremental migration?',
+        q: 'One-shot cutover vs incremental migration?',
         options: [
-          'Incremental: per-table or per-tenant, dual-write in application.',
-          'One-shot: drain, cutover, validate, done.',
+          'Incremental: per-table/per-tenant, dual-write app translation = permanent tech debt.',
+          'One-shot: drain, cutover, validate.',
         ],
         chosen: 'One-shot.',
-        why: 'MySQL and Postgres are fundamentally incompatible — dual-write requires app-level translation = permanent tech debt and perf cost. Schema differences (engine, charset, partition, sequences) make per-table impractical. One-shot also gives clean rollback: revert config, restart.',
-        tradeoff: '2-3 hour downtime. Mitigated by lowest-traffic scheduling, exhaustive cutover rehearsals, pre-signed-off readiness checklists.',
+        why: 'MySQL and Postgres are fundamentally incompatible — dual-write requires application-level translation, permanent perf cost. Schema differences (engine, charset, partition, sequences) make per-table migration impractical. 3-5 hour downtime worth eliminating weeks of dual-write complexity.',
+        tradeoff: '3-5 hour cutover window. Mitigated by lowest-traffic scheduling, rehearsals, pre-signed readiness checklists.',
       },
     ],
     algorithms: [
       {
-        name: 'Sequence sync post-load',
-        description: 'After DMS bulk load, every Postgres BIGSERIAL must be synced to MAX(id). Script iterates sequences and runs setval(seq, COALESCE(MAX(id), 1)). Verified by audit query.',
+        name: 'Sequence sync post-load (setval)',
+        description:
+          'After DMS bulk load, iterate every Postgres BIGSERIAL sequence and run SELECT setval(\'<seq>\', COALESCE((SELECT MAX(id) FROM <table>), 1)). Verified by audit query.',
         complexity: 'O(N tables).',
-        why: 'Without this, first insert post-cutover collides with existing ID — silent corruption.',
+        why: 'Without it, first insert post-cutover collides with existing ID — silent corruption. Required runbook step.',
       },
       {
-        name: 'Workflow-scoped data parity (DeepChecks)',
-        description: 'Per high-traffic workflow: scheduled diff between source/target — row count, column-level checksum sample, spot-row diff. Field normalization. Bounded by tenant + time window for in-flight writes.',
-        complexity: 'O(sampled rows) per check, parallelizable.',
-        why: 'Full-row, full-table diff at 32TB is infeasible. Sampling + checksum gives statistical confidence at tractable cost.',
+        name: 'Three-layer parity validation',
+        description:
+          'Three independent layers run concurrently before cutover: (1) Deepchecks for DB parity (row count, checksum, spot-diff); (2) Traffic replay on parallel app stack to validate request/response and performance at production scale; (3) Batch ingestion parity to validate data lake pipeline. All three green = cutover precondition.',
+        complexity: 'Parallel per-layer.',
+        why: 'Each layer catches a different class of issue. DB drift won\'t catch HQL behavior differences (collation, isolation). Traffic replay won\'t catch downstream pipeline drift. Batch ingestion catches data lake schema/value drift.',
       },
       {
-        name: 'BFS over FK graph for impacted-data verification',
-        description: 'Per write workflow: traverse FK graph from tenant_id + parent_record. Spot-check DMS preserved relational integrity.',
-        complexity: 'O(impacted rows) per workflow.',
-        why: 'DMS can replicate rows without preserving relational integrity in edge cases. BFS catches FK orphans.',
+        name: 'Transaction isolation explicit annotation',
+        description:
+          'All 95 @Transactional methods audited. Explicit @Transactional(isolation = Isolation.REPEATABLE_READ) on critical paths: idempotency checks, concurrent series updates, name uniqueness. Concurrent test suite added.',
+        complexity: 'One-time audit + ongoing.',
+        why: 'Postgres defaults to READ COMMITTED; MySQL InnoDB defaults to REPEATABLE READ. Implicit isolation is engine-dependent. Explicit annotation makes isolation engine-agnostic.',
       },
     ],
     numbers: [
       { metric: 'Flyway migrations converted', value: '684+', note: 'V20170216 to V20250821. AUTO_INCREMENT → BIGSERIAL, UNSIGNED → CHECK, ENGINE/CHARSET stripped.' },
-      { metric: 'Tables migrated', value: '100+', note: 'Plus indexes, FK constraints, sequences.' },
-      { metric: 'Total data size', value: '32 TB + 5 TB audit', note: 'Largest unsharded migration in South Asia Pacific per AWS SME.' },
-      { metric: 'Environments', value: '8+', note: 'qal, e2e, prf, stg, prod + regional. Each with config drift requiring per-env validation.' },
-      { metric: 'JSON parsing code reduction', value: '~60%', note: 'jsonb operators (->>, @>) replaced custom JSON_EXTRACT wrappers.' },
-      { metric: 'P0/P1 issues post-cutover', value: '0', note: 'Three parity layers + rehearsed rollback.' },
-      { metric: 'Cutover window', value: '2-3 hours', note: 'Lowest-traffic weekend. Code freeze + outbox drain + DMS switch + app config + post-checks.' },
-      { metric: 'Stored procedures rewritten', value: '5+', note: 'PL/pgSQL: outbox partition mgmt, heartbeat, data seeding.' },
+      { metric: 'Total data size', value: '32 TB + 5 TB audit', note: 'Per AWS SME, largest unsharded migration in South Asia Pacific. Phrase as "per AWS SME" not absolute.' },
+      { metric: 'JSON parsing code reduction', value: '60%', note: 'Postgres jsonb operators replaced custom MySQL JSON_EXTRACT wrappers.' },
+      { metric: 'Stored procedures rewritten', value: '3', note: 'PL/pgSQL: outbox partition management, heartbeat, data seeding.' },
+      { metric: '@Transactional methods audited', value: '95 locations', note: 'For explicit isolation level annotation.' },
+      { metric: 'P0/P1 issues post-cutover', value: '0', note: 'Achieved through three parity layers + rehearsed rollback.' },
+      { metric: 'Cutover window', value: '3-5 hours', note: 'Lowest-traffic scheduling. Code freeze + outbox drain + DMS switch + app config + post-checks.' },
     ],
     warStories: [
       {
-        scenario: 'CHAR(15) silent join failure',
-        whatHappened: 'During parity, HQL JOINs returned different result sets in Postgres. CHAR(15) padding: MySQL ignores trailing spaces in comparison, Postgres does not. \'abc\' = \'abc \' is true in MySQL, false in Postgres.',
-        howResolved: 'Migration converted all CHAR(15) → VARCHAR(255). Java entities already use String, no code change. Re-ran parity, JOINs matched.',
-        lesson: 'Fixed-length string semantics are a silent foot-gun. VARCHAR by default.',
+        scenario: 'CHAR(15) padding semantics difference',
+        whatHappened:
+          'MySQL CHAR pads with spaces and ignores trailing spaces in comparison; Postgres includes them. \'abc\' = \'abc \' is true in MySQL, false in Postgres. Identified in pre-migration audit as a risk to all HQL joins on CHAR(15) columns.',
+        howResolved:
+          'Migration V20251104210000__fix_char15_columns.sql converts all CHAR(15) → VARCHAR(255). Java entities already use String, no code change needed. Re-validated joins in parity.',
+        lesson:
+          'Fixed-length string semantics differ across engines. VARCHAR by default unless there is a specific reason for fixed-length.',
       },
       {
-        scenario: 'AUTO_INCREMENT vs sequence gaps',
-        whatHappened: 'Post-DMS-load, first INSERT in non-prod failed with duplicate key. Sequence at 1, MAX(id) ~10M.',
-        howResolved: 'Ran setval() for every sequence post-load. Added to runbook as mandatory step.',
-        lesson: 'Bulk-load + sequence handoff is a known foot-gun. Bake into runbook, do not rely on memory.',
+        scenario: 'Sequence vs AUTO_INCREMENT handoff',
+        whatHappened:
+          'Documented risk: post-DMS-load, Postgres sequences start at 1 while tables contain millions of rows. First INSERT would collide with existing IDs.',
+        howResolved:
+          'setval() applied to every sequence after bulk load. Added to cutover runbook as mandatory step. GenerationType.IDENTITY + use-new-id-generator-mappings: false on the Hibernate side abstracts the engine difference.',
+        lesson:
+          'Bulk-load + auto-increment handoff is a known foot-gun across engine migrations. Treat as a runbook step, not an assumption.',
       },
       {
-        scenario: 'JSON column custom type',
-        whatHappened: 'MySQL stored JSON as native; Postgres needed jsonb. Hibernate did not handle conversion automatically.',
-        howResolved: 'Built PostgreSQLJsonType implementing Hibernate UserType. @TypeDef on entities. Round-trip serialization tested. No MySQL-specific JSON functions in queries, so query layer was clean.',
-        lesson: 'For non-trivial type mapping, build a Hibernate UserType. Generic ORM behavior is a coin flip on edge types.',
+        scenario: 'JSON type conversion',
+        whatHappened:
+          'MySQL stored JSON as native JSON type; Postgres needs jsonb. Hibernate does not handle this automatically. Risk: data corruption on read or write.',
+        howResolved:
+          'Built PostgreSQLJsonType implementing Hibernate UserType. Entity annotated with @TypeDef. Serialization tested round-trip. No MySQL-specific JSON functions found in queries (e.g., JSON_EXTRACT), so query layer was clean.',
+        lesson:
+          'For any non-trivial type mapping in ORM migrations, build a custom UserType. Generic ORM defaults are unpredictable on engine-specific types.',
       },
       {
-        scenario: 'Transaction isolation surprise',
-        whatHappened: 'Idempotency check in payment flow relied on REPEATABLE READ (MySQL default). Postgres defaults to READ COMMITTED, occasionally missing duplicates under concurrent load.',
-        howResolved: 'Audited all @Transactional methods (95 locations). Explicit @Transactional(isolation = Isolation.REPEATABLE_READ) on critical paths: idempotency, concurrent series updates, name uniqueness. Concurrent test suite added.',
-        lesson: 'Isolation level defaults differ across engines. Migration is the time to make isolation explicit.',
+        scenario: 'Transaction isolation default difference',
+        whatHappened:
+          'MySQL InnoDB defaults to REPEATABLE READ; Postgres defaults to READ COMMITTED. Idempotency checks and concurrent updates that relied on REPEATABLE READ semantics would silently behave differently.',
+        howResolved:
+          'Application team audited all 95 @Transactional methods. Explicit @Transactional(isolation = Isolation.REPEATABLE_READ) on critical operations: idempotency checks, concurrent series updates, name uniqueness. Concurrent test suite added.',
+        lesson:
+          'Isolation level defaults differ across engines. Engine migration is the right time to make isolation explicit, never implicit.',
       },
       {
-        scenario: 'Outbox during cutover — duplicate event risk',
-        whatHappened: 'Plan was to stop forward DMS and switch app. But MySQL outbox still had unpublished events. If we stopped, they would never publish; if we let them publish, consumers would see them after Postgres published, causing ordering issues.',
-        howResolved: 'Added explicit "drain MySQL outbox" step between code freeze and DMS stop. Outbox CDC catches up, consumers process, then DMS stops, then Postgres takes over publishing to original topics.',
-        lesson: 'CDC pipelines have inertia. Cutover sequence must account for in-flight events, not just in-flight transactions.',
+        scenario: 'Outbox during cutover',
+        whatHappened:
+          'MySQL outbox could have unpublished events at cutover. Stopping forward DMS without draining would lose them; allowing them to publish while Postgres outbox also publishes would cause ordering issues and duplicates.',
+        howResolved:
+          'Cutover runbook includes explicit drain step: drain MySQL outbox, confirm CDC catches up, stop forward DMS, switch Postgres outbox to publish on original topics.',
+        lesson:
+          'CDC pipelines have inertia. Cutover sequencing must account for in-flight events, not just in-flight transactions.',
       },
     ],
     edgeCases: [
-      { case: 'DMS lag spike during cutover', handling: 'Runbook explicit DMS lag check before proceeding. If lag > threshold, abort and retry. Lag monitor alerts during cutover.' },
-      { case: 'Reverse replication direction switch', handling: 'Pre-cutover, reverse DMS staged not active. At cutover, forward DMS stops, reverse DMS starts. Validated in rehearsals.' },
-      { case: 'Schema drift across environments', handling: 'Pre-migration audit: dump and diff every env. Drift reconciled in MySQL before migration. Otherwise env-specific paths multiply.' },
-      { case: 'NULLS ordering difference (FIRST vs LAST)', handling: 'Audit found most ORDER BY on non-nullable id columns — no impact. Nullable date columns got explicit NULLS LAST in HQL.' },
-      { case: 'Postgres sequence cache and ID gaps', handling: 'Postgres pre-allocates 20 IDs by default; gaps appear on crash/rollback. No business logic assumes consecutive IDs — verified by code audit.' },
-      { case: 'In-flight tenant transactions at cutover', handling: 'Code freeze + readiness checklist. No active long-running txns. App drained before DMS stop.' },
+      { case: 'DMS lag during cutover', handling: 'Explicit lag check before proceeding. Abort and retry if lag > threshold. Lag monitor alerts during the entire cutover window.' },
+      { case: 'Reverse replication for rollback', handling: 'Cluster C (MySQL 5.7) replicates from Cluster B (Postgres) post-cutover. Acts as rollback target if Postgres issues surface. Cluster A serves as last-resort fallback if B→A replication fails.' },
+      { case: 'Schema drift across 8+ environments', handling: 'Pre-migration audit: dump and diff every environment. Drift reconciled in MySQL before migration. Otherwise per-env paths multiply.' },
+      { case: 'Stored procedures (outbox partition mgmt, heartbeat, data seeding)', handling: '3 procedures rewritten in PL/pgSQL. Outbox partition strategy uses PostgreSQL functions (CREATE OR REPLACE FUNCTION add_partition...) to maintain time-based partitioning.' },
+      { case: 'NULLS ordering difference (FIRST vs LAST)', handling: 'Audit found most ORDER BY on non-nullable id columns — no impact. Nullable columns got explicit NULLS LAST in HQL where needed.' },
+      { case: 'In-flight tenant transactions at cutover', handling: 'Code freeze + readiness checklist. App layer drained before DMS stop. No active long-running transactions at cutover start.' },
     ],
     whatIWouldChange:
-      '(1) Earlier schema drift audit — discovered non-standard env customizations late. (2) Better DMS lag observability — had it, but alerting thresholds were tuned during cutover, not before. (3) Rehearse rollback in production-equivalent staging twice — did once, second would have surfaced a timing assumption.',
+      'Retrospective opinion to verify before claiming. Possibilities: earlier schema drift audit across all 8+ envs (some non-standard customizations surfaced late); DMS lag alerting thresholds tuned pre-cutover instead of during; rehearse rollback in production-equivalent staging at least twice. Mark as your view, not source-documented.',
     chains: [
       {
         title: 'The direct-migration justification chain',
         steps: [
-          { q: 'Why direct migration?', a: 'Single effort, immediate benefits, no MySQL 8 interim cost, no dual-system overhead.' },
-          { q: 'What if Postgres 15 has a regression you don\'t catch?', a: 'Three parity layers de-risk. Rollback cluster ready, tested. Rollback target: minutes.' },
-          { q: 'Have you actually tested the rollback?', a: 'Yes, non-prod cutover rehearsals end-to-end including outbox drain, DMS direction switch, app restart.' },
-          { q: 'What\'s your rollback trigger?', a: 'Multiple: deepchecks mismatch above threshold, DMS lag spike, P0 customer symptoms, replication health failure.' },
-          { q: 'What if you discover the issue 12 hours post-cutover?', a: 'Reverse DMS keeps syncing. Rollback up to the point reverse replication is healthy. Beyond: PITR from backup + manual reconciliation.' },
+          { q: 'Why direct rather than staged via MySQL 8?', a: 'Single effort, immediate Postgres benefits, no MySQL 8 licensing interim, no dual-system operational overhead.' },
+          { q: 'How did you justify the bigger one-time risk?', a: 'Three parity layers (DB, traffic replay, batch ingestion) plus three-cluster topology with reverse DMS for rollback. Rollback target measured in minutes.' },
+          { q: 'What was your rollback trigger?', a: 'Deepchecks mismatch above threshold, DMS lag spike, P0 customer-facing symptoms, or replication health failure.' },
+          { q: 'Have you tested the rollback?', a: 'Rehearsed in non-prod cutover dry runs end-to-end including outbox drain, DMS direction switch, app restart on MySQL.' },
         ],
       },
       {
         title: 'The data-correctness chain',
         steps: [
-          { q: 'How do you know 100M rows match?', a: 'Three layers: DB parity (count + checksum + spot-diff), app parity (traffic replay), pipeline parity (batch ingestion).' },
-          { q: 'What if deepchecks shows 0.01% drift?', a: 'Investigate. Most likely non-deterministic field for ignore list. If real, block cutover.' },
-          { q: 'How do you handle a tenant in active write at cutover?', a: 'Code freeze, app drained, outbox drained. No active writes at cutover start.' },
-          { q: 'What about read-only consumers reading stale Postgres post-cutover?', a: 'Forward DMS stopped at cutover. Postgres is source of truth. Consumers see Postgres-only state.' },
+          { q: 'How do you know everything matches across 32 TB?', a: 'Three layers: DB parity (Deepchecks: row count, checksum, spot-diff), application parity (traffic replay validates request/response and perf), pipeline parity (batch ingestion to data lake validated separately).' },
+          { q: 'What if Deepchecks shows small drift?', a: 'Investigate. Most likely non-deterministic field requiring ignore-list update. If real, block cutover until resolved.' },
+          { q: 'How are in-flight transactions handled at cutover?', a: 'Code freeze before cutover, app drained, outbox drained. No active writes at cutover start.' },
         ],
       },
       {
-        title: 'The downstream impact chain',
+        title: 'The schema-conversion chain',
         steps: [
-          { q: 'What about CDC consumers downstream of MySQL?', a: 'Two CDC integrations: outbox (denormalized events) and batch ingestion (normalized to data lake). Parallel pipelines for Postgres validated during parity.' },
-          { q: 'How do consumers know which DB to listen to?', a: 'During parity, parallel pipelines publish to temp topics. At cutover, MySQL outbox drained, Postgres outbox starts publishing to original topics. Consumers see no topic change.' },
-          { q: 'What if a consumer caches MySQL-specific entity IDs?', a: 'IDs preserved — DMS keeps PKs exactly. Verified in parity.' },
+          { q: 'CHAR(15) — what was the issue and fix?', a: 'MySQL ignores trailing spaces in CHAR comparison, Postgres does not. \'abc\' = \'abc \' is true in MySQL, false in Postgres. Fixed via migration V20251104210000__fix_char15_columns.sql converting CHAR(15) → VARCHAR(255).' },
+          { q: 'How did you handle JSON columns?', a: 'PostgreSQLJsonType implementing Hibernate UserType with @TypeDef. Round-trip tested. No MySQL-specific JSON functions in HQL.' },
+          { q: 'Case-insensitive matching?', a: 'CREATE COLLATION case_insensitive with ICU provider, locale und-u-ks-level2, deterministic = false. Applied via ALTER TABLE. Matches MySQL utf8_general_ci.' },
+          { q: 'Transaction isolation?', a: '95 @Transactional methods audited. Explicit REPEATABLE_READ on idempotency checks, concurrent series updates, name uniqueness.' },
         ],
       },
     ],
   },
   'change-orders': {
     framing:
-      'Financial features get probed hardest on correctness and edge cases. Status transitions, rollup invariants, and audit traceability are the three pillars they will hammer.',
+      'Financial feature with extensive PRD documentation. All decisions, rules, and edge cases below are from your PRD. The "failure modes designed for" section contains documented risks from your PRD that the design accounts for — NOT incidents you should claim happened unless you recall them.',
     decisions: [
       {
         q: 'Change Order as separate transaction vs estimate edit?',
         options: [
-          'Edit estimate in place: simplest, breaks audit trail.',
-          'Versioned estimate: complex versioning on a financial entity.',
+          'Edit estimate in place: breaks audit trail.',
           'Separate CO linked to estimate: preserves immutability, clean audit.',
         ],
         chosen: 'Separate CO linked to estimate.',
-        why: 'Audit traceability is non-negotiable for financial docs. Original estimate must remain immutable. Customer signoff applies to a specific state — that state must be preserved verbatim.',
-        tradeoff: 'More complex rollup (estimate = original + accepted COs). Extra UI surface. Worth it for audit + signoff.',
+        why: 'Original estimate must remain immutable for audit + customer signoff. CO is "an additional line" that updates the overall estimate total only when accepted. Audit traceability is non-negotiable.',
+        tradeoff: 'More complex rollup logic (estimate total = original + accepted COs). Worth it for audit + signoff guarantees.',
       },
       {
         q: 'Allow CO to edit any line attribute, or only qty on existing lines?',
         options: [
-          'Full edit: max flexibility, breaks "what changed" audit.',
-          'Qty-only on existing + full edit on new: maintains link to original.',
+          'Full edit on existing lines: max flexibility, original estimate effectively rewritten.',
+          'Qty-only on existing + full edit on new lines.',
         ],
         chosen: 'Qty-only on existing + full edit on new.',
-        why: 'A CO is "what changed about scope/quantity," not "rewrite the estimate." If user needs to change rate or description, they create a new estimate. Keeps narrative clear: existing got more/less, new items added.',
-        tradeoff: 'Users sometimes want to edit other attributes. Documented workaround: new estimate.',
+        why: 'A CO is "an additional line" to the original estimate. Only editable field for existing P/S is qty. New P/S can be added with full attributes. If user needs to change other attributes on existing items, they must edit the original estimate or create a new one.',
+        tradeoff: 'Documented constraint; some users may expect more flexibility. PRD explicit on this rule.',
       },
       {
-        q: 'Rollup calculation — independent per surface, or single pipeline?',
+        q: 'Status-based inclusion rules in totals?',
         options: [
-          'Each report calculates its own rollup: simpler per-surface.',
-          'Single rollup pipeline feeding all surfaces: more upfront work, no drift.',
+          'Implicit: hidden in helpers.',
+          'Explicit per-status: Pending shown but excluded from total, Accepted included, Rejected hidden.',
         ],
-        chosen: 'Single rollup pipeline.',
-        why: 'Independent paths drift over time. Bug discovered in pre-prod E vs A report had a sibling bug in WIP report — same root cause. Single pipeline = single source of truth = single bug surface.',
-        tradeoff: 'Higher upfront coordination cost. Massive payoff in correctness.',
+        chosen: 'Explicit per-status rules.',
+        why: 'Pending CO shows on PCE with a Section header (no P/S lines) — visible but not counted. Accepted CO shows as a non-editable section with P/S details, included in updated estimate total. Rejected CO never shown.',
+        tradeoff: 'More rules to document and test. Required for correct financial behavior.',
       },
       {
-        q: 'Status-based inclusion rules — implicit or explicit?',
+        q: 'Invoice from CO directly or only from PCE?',
         options: [
-          'Implicit: "if accepted, include" buried in helpers.',
-          'Explicit: per-status inclusion rules documented and tested.',
+          'Allow from CO: two invoice paths.',
+          'Only from PCE: single invoice path; PCE total reflects accepted COs.',
         ],
-        chosen: 'Explicit.',
-        why: 'Pending shows on PCE but does not contribute. Accepted contributes. Declined excluded. Rules must be testable and inspectable, not "if status === \'ACCEPTED\'" buried in a helper.',
-        tradeoff: 'More upfront docs. Pays back first time a sibling team asks "what about declined COs in this new report?"',
+        chosen: 'Only from PCE. Create Invoice CTA disabled on CO form.',
+        why: 'An invoice can only ever be created from an Estimate. The Estimate already includes accepted COs in its updated total. Single invoice path eliminates double-billing risk and ambiguity.',
+        tradeoff: 'Users initially confused. PRD documents this explicitly; CTA disabled to prevent the action.',
       },
       {
-        q: 'CO + PCE relationship — bidirectional or one-way?',
+        q: 'Sales tax recalculation on CO accept — preserve PCE override or recalculate?',
         options: [
-          'One-way (CO knows PCE): simple, but PCE cannot show CO sections.',
-          'Bidirectional: PCE shows accepted COs as sections, CO references PCE.',
+          'Preserve PCE tax override.',
+          'Recalculate on accept; remove PCE tax override.',
         ],
-        chosen: 'Bidirectional.',
-        why: 'PCE displays accepted COs as appended sections (auditor-friendly). CO references parent PCE (creation context, validation). One-way forces redundant queries.',
-        tradeoff: 'Two referential paths to keep consistent. Wrapped in transaction at accept/decline.',
+        chosen: 'Recalculate, remove override.',
+        why: 'PRD rule: "Every time change order line items are added back to a project estimate, and that project estimate sales tax had an override, the override will be removed and the sales tax will calculate based on automatic sales tax calculation." Tax must reflect updated scope to comply with sales tax rules.',
+        tradeoff: 'User tax override is lost. Documented behavior.',
       },
       {
-        q: 'Invoicing — allow from CO directly or only from PCE?',
+        q: 'Discount on CO — support or defer?',
         options: [
-          'Allow from CO: matches user mental model, creates two invoice paths.',
-          'Only from PCE (aggregates accepted COs): single invoice path.',
+          'Support in Phase 1: complex merge rules with PCE discount.',
+          'Phase 1: no discount on CO. Phase 2: support.',
         ],
-        chosen: 'Only from PCE.',
-        why: 'Single invoice path = no double-billing risk. PCE total already reflects accepted COs. CO is for scope tracking, not separate billing.',
-        tradeoff: 'Users initially confused. Mitigated by disabling Create Invoice CTA on CO + KB.',
-      },
-      {
-        q: 'Tax handling — recalculate on CO accept, or preserve PCE tax?',
-        options: [
-          'Preserve PCE tax: simplest, understates tax on accepted CO scope.',
-          'Recalculate on CO accept: correct, invalidates user override.',
-        ],
-        chosen: 'Recalculate on accept, remove PCE override.',
-        why: 'Tax must reflect updated scope to comply with sales tax rules. Overrides represent a decision that becomes stale when scope changes. Documented: accepting a CO removes any PCE tax override.',
-        tradeoff: 'Lost user override. Surfaced in CO accept warning. Power-user complaint, accepted as correctness call.',
+        chosen: 'No discount on CO in Phase 1.',
+        why: 'When a CO without discount is added to a PCE with a % discount, the % continues to apply. Reduces Phase 1 complexity; Phase 2 adds support.',
+        tradeoff: 'Limited Phase 1 functionality on discounts. Documented.',
       },
     ],
     algorithms: [
       {
-        name: 'Rollup recomputation pipeline',
-        description: 'On CO status transition: (1) fetch parent PCE, (2) fetch accepted COs, (3) sum line-level cost and income, (4) recompute discount/tax/shipping per merge rules, (5) recompute margin, (6) emit rollup event. Idempotent.',
-        complexity: 'O(accepted COs × lines per CO).',
-        why: 'Status changes are the only triggers. Polling wasteful. Idempotency lets us re-run on suspicion of drift without side effects.',
+        name: 'Status-based rollup with explicit inclusion rules',
+        description:
+          'CO total counted in PCE updated total only when status = Accepted. Pending: shown on PCE with Section header, no P/S items, no total impact. Rejected: never shown. On accept, CO lines added to PCE; on reject (from accepted), lines removed and PCE recalculates.',
+        complexity: 'O(accepted COs × lines) per recomputation.',
+        why: 'Independent calculation paths would drift. Single rollup logic feeding all surfaces (PCE display, reports, KPIs) prevents double-counting and inconsistency.',
       },
       {
-        name: 'Status state machine with invariants',
-        description: 'States: Pending → Accepted, Pending → Declined, Accepted → Declined (warning if partially invoiced). Invariants: no Declined → Pending. Pending → Accepted requires signoff (Phase 2). Transitions emit audit entries.',
-        complexity: 'O(1) per transition.',
-        why: 'Financial state must be deterministic. State machine encodes legal transitions; everything else rejected at service layer.',
-      },
-      {
-        name: 'Discount % → $ merge calculation',
-        description: 'PCE has 10% discount. CO has no discount in Phase 1. On accept, CO lines added; discount remains 10% on new total. If PCE discount was $, just combine. If %, recompute against new pre-discount total.',
+        name: 'Discount % → $ merge rules on CO accept',
+        description:
+          'PCE % discount: stays as %, applies to new total including accepted CO lines. PCE $ discount: combine with CO discount if any. If CO subsequently rejected after merge, remove associated discount amount.',
         complexity: 'O(1) per merge.',
-        why: 'Discount semantics differ between % and $. Merge rules documented and unit-tested for every combination.',
+        why: 'Discount semantics differ between % and $ representations. Merge rules documented per combination.',
+      },
+      {
+        name: 'Sales tax recalculation pipeline',
+        description:
+          'On CO accept: tax recalculated against linked PCE date and current rates. If PCE tax had an override, override removed. If tax rates changed between PCE creation and CO creation, PCE line items also recomputed at new rates during the merge. Tax exemption on linked customer is always respected.',
+        complexity: 'O(line items) per recompute.',
+        why: 'Tax compliance requires accurate calculation against current rates and updated scope. Override removal is the documented contract.',
       },
     ],
     numbers: [
-      { metric: 'Manual estimate edit reduction', value: '80%', note: 'Pre vs post-launch in tenants with active project workflows.' },
-      { metric: 'Businesses impacted', value: '50K+', note: 'Across QBO Alpha rollout in US/CA/AU/UK (TXP-dependent).' },
-      { metric: 'Reports with new CO columns', value: '6', note: 'E vs A, E vs A by Project, WIP, Committed Costs, Cost to Complete, CO Report.' },
-      { metric: 'Status transitions modeled', value: '3 + 1 special', note: 'Pending→Accepted, Pending→Declined, Accepted→Declined-after-invoicing.' },
-      { metric: 'Audit log integration', value: 'Per-edit + restore', note: 'Every edit logged under CO. Restore Version supported.' },
+      { metric: 'Manual estimate edit reduction', value: '80%', note: 'Per resume claim.' },
+      { metric: 'Businesses impacted', value: '50K+', note: 'QBO Alpha rollout.' },
+      { metric: 'Markets', value: 'US, Canada, AU, UK', note: 'Global readiness dependent on TXP availability; currently only works for US.' },
+      { metric: 'Target segment', value: 'Mid-market', note: 'Focus on construction and professional services.' },
+      { metric: 'Status values', value: '3 (Pending / Accepted / Rejected)', note: 'Plus inclusion rules per status.' },
+      { metric: 'New reports', value: 'Change Order Report + columns in existing reports', note: 'CO by Project, CO by Status, CO by E vs A.' },
     ],
     warStories: [
       {
-        scenario: 'Double counting in pre-prod',
-        whatHappened: 'Pre-launch testing: 2 accepted COs on a PCE, some KPIs counted one twice. Two independent calculation paths — KPI service vs report service — diverged on a recent change.',
-        howResolved: 'Consolidated to a single rollup pipeline. KPI and report services subscribe to the materialized rollup. Drift impossible by design.',
-        lesson: 'When two surfaces calculate the same metric independently, they will drift. Single pipeline is the only sustainable answer.',
+        scenario: 'Pending CO must show on PCE but not affect total',
+        whatHappened:
+          'Documented requirement: pending COs are visible to the user (so they know what is in flight) but cannot affect the PCE total (which only reflects accepted scope).',
+        howResolved:
+          'PCE renders pending COs with a Section header and no P/S line items. Updated estimate total excludes pending. Documented and tested per status.',
+        lesson:
+          'Visibility and totaling are independent concerns in financial UI. Make rules explicit per status.',
       },
       {
-        scenario: 'Partial-invoiced CO decline',
-        whatHappened: 'User accepted a CO, partially invoiced it, declined it. Expected behavior undefined. Some users wanted invoice unchanged, others wanted it voided.',
-        howResolved: 'Documented rule: invoice is point-in-time, never retroactively modified. Decline removes CO lines from PCE going forward, invoice stays. Warning on decline so user knows invoice will be stranded.',
-        lesson: 'Financial documents are point-in-time records. Designing for "retroactive correctness" creates more confusion than it solves.',
+        scenario: 'Accepted CO subsequently rejected after partial invoicing',
+        whatHappened:
+          'Documented scenario: user accepts a CO, partially invoices it (since invoicing flows through PCE which now includes the accepted CO), then rejects the CO.',
+        howResolved:
+          'Per PRD: rejecting an accepted CO removes its lines from the PCE going forward. The invoice already issued remains historical and unchanged. PCE total recalculates without the rejected CO.',
+        lesson:
+          'Invoices are point-in-time financial documents. State changes on the source (estimate/CO) do not retroactively alter issued invoices.',
       },
       {
-        scenario: 'Tax override conflict',
-        whatHappened: 'User set tax override on PCE (custom contract rate). On CO accept, rollup recomputed tax — override was lost.',
-        howResolved: 'Explicit warning on CO accept: "Accepting will recalculate sales tax. Your custom override will be removed." Documented in KB. User chooses.',
-        lesson: 'Financial overrides represent intent that must be re-affirmed on context change. Silent loss is unacceptable.',
+        scenario: 'PCE tax override invalidated by CO accept',
+        whatHappened:
+          'Documented behavior: if PCE has a tax override (custom rate due to specific contract), accepting a CO recalculates tax against current rates — removing the override.',
+        howResolved:
+          'PRD documents this as the contract: "the override will be removed and the sales tax will calculate based on automatic sales tax calculation." User-facing communication required to explain the rule.',
+        lesson:
+          'Tax rules must be deterministic and rule-driven. Overrides represent a moment-in-time decision that becomes stale when scope changes.',
       },
       {
-        scenario: 'Estimate decline cascading to COs',
-        whatHappened: 'User declined a PCE that had 2 accepted COs. Question: should COs follow to Declined, or stay Accepted but become "obsolete"?',
-        howResolved: 'Decision: COs preserve their state for audit history. PCE decline shows warning ("These COs become obsolete"). If PCE re-accepted later, COs become valid again without manual restate.',
-        lesson: 'Cascading state changes destroy audit history. Preserve state, communicate context.',
+        scenario: 'Discount % conversion on CO merge',
+        whatHappened:
+          'PRD: when CO with no discount is merged into PCE with % discount, the % continues to apply to the new total. When the combination involves a $ discount on either side, conversion rules apply: % → $ for combining; on rejection, remove the associated amount.',
+        howResolved:
+          'Merge rules documented per combination (%/%, %/$, $/%, $/$). On CO reject after merge, associated discount amount removed from PCE.',
+        lesson:
+          'Discount semantics differ between % and $ representations. Merge rules must cover every combination explicitly.',
       },
     ],
     edgeCases: [
-      { case: 'Multiple pending COs on same PCE', handling: 'All visible on PCE as grayed sections. None counted in totals. User accepts/declines each individually. No count restriction.' },
-      { case: 'PCE has no accepted CO but has pending — invoice', handling: 'Invoice draws from PCE total (excludes pending). Pending surfaced for awareness but not billed.' },
-      { case: 'Tax-exempt customer with CO', handling: 'Exemption respected. CO lines inherit taxable flag from PCE. Tax recalculated against exemption status.' },
-      { case: 'Multi-currency PCE + CO', handling: 'CO must match PCE currency. Phase-2 multi-currency support extends this.' },
-      { case: 'Discount % → $ rounding edge', handling: 'Banker\'s rounding (round-half-to-even) for $ conversion. Documented in tax/discount merge spec.' },
-      { case: 'CO with negative line items', handling: 'Phase 1: total cannot be negative (lines can be, total cannot). Phase 2: full negative for refund-style COs.' },
+      { case: 'Multiple pending COs on the same PCE', handling: 'All visible as grayed sections on PCE. None counted in updated total. User accepts/rejects each individually. No restriction on count.' },
+      { case: 'No accepted, pending, or converted PCE exists', handling: 'CO cannot be created. User prompted to create a Project Estimate first.' },
+      { case: 'Tax-exempt customer linked to project', handling: 'Tax exemption respected throughout. CO line items inherit taxable flag from PCE.' },
+      { case: 'CO accepted then rejected after partial invoicing', handling: 'CO lines removed from PCE going forward. Issued invoice unchanged (historical). PCE total recalculates without the CO.' },
+      { case: 'Tax rate changes between PCE and CO creation', handling: 'On CO accept merge, PCE line items recomputed at new tax rate. CO sales tax always calculated based on linked PCE date.' },
+      { case: 'Shipping amount on CO', handling: 'Added back to PCE shipping field on accept. Removed if CO subsequently rejected.' },
+      { case: 'Negative CO total in Phase 1', handling: 'Total of CO must be >= $0. Individual line items can be negative as long as total is non-negative. Phase 2: full negative support for refund-style COs.' },
     ],
     whatIWouldChange:
-      '(1) Build rollup pipeline first, UI second. We built in parallel; integration ate two weeks. (2) Versioning of accepted CO state deeper than current restore — full point-in-time recreation. (3) Surface tax override warning earlier in CO creation flow, not just on accept — would have saved several escalations.',
+      'Retrospective opinion only. Examples to consider: building the rollup pipeline first then UI; deeper versioning for accepted CO state; surfacing tax override warning earlier in CO creation. Mark as your view, not source-documented.',
     chains: [
       {
-        title: 'The rollup-correctness chain',
+        title: 'The CO lifecycle chain',
         steps: [
-          { q: 'How do you guarantee KPIs and reports show the same number?', a: 'Single rollup pipeline feeds both. Read from materialized rollup, not independent calculations.' },
-          { q: 'What triggers the rollup?', a: 'CO status transitions: Pending→Accepted, Accepted→Declined, etc. Pipeline is idempotent.' },
-          { q: 'What if the pipeline lags?', a: 'KPI/report shows last-good rollup. Lag monitored; alert fires above threshold. Bounded recompute means worst-case lag is seconds.' },
-          { q: 'How do you prevent double-counting with 3 accepted COs?', a: 'Pipeline sums each CO\'s lines exactly once. Idempotency means re-running gives same answer. Unit test covers N-CO cases.' },
+          { q: 'What happens when a CO is created?', a: 'Linked to a Pending, Accepted, or Converted PCE. Status starts as Pending. Shown on PCE as Section header without P/S lines. Not counted in updated estimate total.' },
+          { q: 'On accept?', a: 'CO added to PCE as a non-editable section with P/S line item details. Total recalculates. Tax recalculates (removing any override). Discount and shipping merged per documented rules.' },
+          { q: 'On reject from accepted?', a: 'CO lines removed from PCE going forward. PCE total recalculates. Associated discount, tax, shipping amounts removed.' },
+          { q: 'What about issued invoices?', a: 'Invoices are point-in-time. They remain historical and unchanged regardless of subsequent CO state changes.' },
         ],
       },
       {
-        title: 'The status-transition chain',
+        title: 'The invoicing chain',
         steps: [
-          { q: 'What happens when accepted CO is declined?', a: 'CO lines removed from PCE rollup. Totals recompute. Tax/discount recompute. Audit log records transition.' },
-          { q: 'What if the CO was partially invoiced?', a: 'Warning shown. On confirm, CO lines removed from PCE, but invoice unchanged. Invoice is historical.' },
-          { q: 'Can a declined CO be re-accepted?', a: 'Phase 1: no — decline is sticky. User creates new CO if scope returns. Phase 2 considers reversal.' },
-          { q: 'How is this audited?', a: 'Every transition logged: timestamp, user, prior state, new state. Restore Version in UI.' },
+          { q: 'Can a user invoice directly from a CO?', a: 'No. Create Invoice CTA is disabled on CO form. Invoice can only be created from an Estimate.' },
+          { q: 'Why?', a: 'PCE total already reflects accepted COs. Single invoice path eliminates double-billing risk.' },
+          { q: 'What if the user has progress-invoiced and then accepts a CO?', a: 'The PCE total updates to include the CO. The next progress invoice shows the updated total minus what has been invoiced. The previously-issued invoice does not retroactively update.' },
+          { q: 'Does the issued invoice get an updated total stamp?', a: 'No. Invoice is point-in-time. PRD: "the invoice I previously sent will have an incorrect estimate total on it as it won\'t include the newly accepted change order." That is the documented behavior.' },
+        ],
+      },
+      {
+        title: 'The tax & discount chain',
+        steps: [
+          { q: 'How is sales tax handled on accept?', a: 'Recalculated against linked PCE date and current rates. If PCE had a tax override, override is removed. If rates changed between PCE creation and CO, PCE line items also recomputed.' },
+          { q: 'What about tax-exempt customers?', a: 'Exemption is always respected. CO line items inherit the taxable flag from PCE.' },
+          { q: 'How are discounts merged?', a: 'Rules documented per combination. Most common in Phase 1: PCE has % discount, CO has none → % continues to apply to new total. On CO reject after merge, associated discount amount removed.' },
         ],
       },
     ],
   },
   'project-budgets': {
     framing:
-      'Probed on two axes: (1) source-of-truth migration without breaking reports/migrations/downgrades, and (2) DataGrid perf at scale. Be ready for both.',
+      'Source-of-truth migration with documented constraint set (1444+ memorized reports, multiple cohorts, downgrade paths). All decisions and constraints below are from your PRD. Failure modes section reflects documented requirements, not historical incidents.',
     decisions: [
       {
-        q: 'Why decouple Project Budgets from Project Estimates entirely?',
+        q: 'Decouple Project Budgets from Project Estimates entirely?',
         options: [
-          'Keep PE as combined cost + income source: matches today, breaks mental model for MM.',
-          'Split: PB = cost source, PE = income source.',
+          'Keep PE as combined cost + income source: matches today, conflates audiences.',
+          'Split: PB = cost source (internal accountant view), PE = income source (customer-facing quote).',
         ],
         chosen: 'Split.',
-        why: 'Construction businesses track 200+ cost codes internally but quote customers at 10 line items. Forcing both into one form breaks mental model and causes report drift. PE = customer-facing quote (income). PB = internal accounting (cost). Different audiences, different granularity.',
-        tradeoff: 'Two entities to maintain, migration complexity for existing users. Worth it for the financial model correctness.',
+        why: 'Project managers need two views: internal accountant-facing (cost breakdown) and external customer-facing (estimates/quotes). PB is granular (cost-code level); PE is high-level. Up to 80% of users use spreadsheets for budgeting today; PB replaces that.',
+        tradeoff: 'Two entities to maintain, migration complexity for existing users. Documented as necessary for the financial model.',
       },
       {
         q: 'One budget per project, or multiple?',
         options: [
           'Multiple budgets per project: max flexibility, ambiguous source of truth.',
-          'One budget per project: clear source of truth, matches FP&A model.',
+          'One budget per project: clear source of truth.',
         ],
         chosen: 'One per project.',
-        why: 'Single internal source of cost truth. Reports unambiguous. Mental model: "the project budget" not "a budget among many." Multiple PEs per project is fine (negotiation iterations), but cost source must be singular.',
-        tradeoff: 'Power users pushed back. Solved via budget versioning (audit log) in V2, not multiple budgets.',
+        why: 'PRD: "Don\'t allow creation of multiple budgets against 1 project. Show an error message if the user attempts to do so." Single internal cost source. Multiple PEs allowed (negotiation iterations), but cost source must be singular.',
+        tradeoff: 'Documented constraint; advanced users requesting versioning addressed via budget revisions, not multiple budgets.',
       },
       {
-        q: 'DataGrid — build custom or use existing FP&A component?',
+        q: 'PB and PE coexistence — independent or coupled?',
+        options: [
+          'Coupled: changes in one trigger the other.',
+          'Independent: PE can exist without PB and vice versa. Updates are user-driven.',
+        ],
+        chosen: 'Independent (V1).',
+        why: 'PRD: "PE can exist without PB and PB without PE. Their existence is not tied to the presence of each other. The decision to update PE / PB when the other is updated is taken by the user in V1."',
+        tradeoff: 'User must manually keep them aligned. V2 considers automation.',
+      },
+      {
+        q: 'DataGrid — build custom or extend FP&A component?',
         options: [
           'Build custom: full control, time cost.',
-          'Reuse FP&A DataGrid: faster, extend for project-specific columns (milestones, dimensions).',
+          'Reuse FP&A DataGrid: faster, already supports virtual scroll and cell editing.',
         ],
         chosen: 'Reuse + extend.',
-        why: 'FP&A DataGrid already supports virtual scroll, cell editing, large row counts (P&L/B/S budgets). Reusing aligned UX across budget types and avoided building a 3500-row perf-tuned grid from scratch.',
-        tradeoff: 'Some friction with FP&A team on extension points. Coordination cost worthwhile.',
+        why: 'FP&A DataGrid already supports P&L and B/S budgets. Reusing aligns UX across budget types. Virtual scroll added to support 3500 lines with milestones (V2). Cell edit SLA target: <0.2s for 23 cols × 3500 lines.',
+        tradeoff: 'Coordination with FP&A team for extension points. Worthwhile vs building from scratch.',
       },
       {
-        q: 'Migration trigger — auto vs opt-in?',
+        q: 'AI-based spreadsheet import or manual mapping only?',
         options: [
-          'Auto-migrate everyone: fastest, no choice, risk of surprise.',
-          'Opt-in + auto-migrate after cutoff.',
-          'Cohort-specific: NTTF/DTM auto, upgraders auto, existing IES opt-in.',
+          'Manual mapping: user maps every column.',
+          'AI-based import with user confirmation per row.',
+        ],
+        chosen: 'AI import with user confirmation.',
+        why: 'PRD documents AI-based spreadsheet import as a differentiator. Per-row confirmation keeps human-in-the-loop for financial accuracy.',
+        tradeoff: 'AI matching can suggest wrong P/S items. User confirmation step required, not optional.',
+      },
+      {
+        q: 'Migration paths — uniform or cohort-specific?',
+        options: [
+          'Uniform auto-migration for all.',
+          'Cohort-specific: NTTFs, Desktop Migrators (Fresh + Importer), Advanced→IES Upgraders, Existing IES users.',
         ],
         chosen: 'Cohort-specific.',
-        why: 'NTTFs/DTM have no historical cost — auto safe. Upgraders sign contract covering migration — auto-acceptable. Existing IES have history + memorized reports — opt-in respects workflow, with CSM outreach + cutoff for eventual auto.',
-        tradeoff: 'Three migration paths. Necessary because cohorts have meaningfully different starting states.',
-      },
-      {
-        q: 'Reporting source switch — instant or dual-mode?',
-        options: [
-          'Instant cutover: clean, breaks reports for non-PB users.',
-          'Dual-mode: PB users see new (cost from PB), non-PB users see old (cost from PE).',
-        ],
-        chosen: 'Dual-mode during rollout.',
-        why: 'Reports must keep working for users not on PB yet. Memorized + custom reports (1444+) carry user expectations. Dual-mode lets us migrate incrementally without breaking existing views.',
-        tradeoff: 'Two report-generation paths during rollout. Cord-cut once 100% on PB.',
-      },
-      {
-        q: 'AI import — sync or async?',
-        options: [
-          'Sync: simplest UX, exceeds 4s SLA at 100+ lines.',
-          'Async with task tracking: progress indicator, resumable, notification on completion.',
-        ],
-        chosen: 'Async.',
-        why: 'Imports of 100-300 lines take 45-50s. Sync would timeout or block UX. Async lets user navigate away.',
-        tradeoff: 'More UX surface (in-progress modal, notifications, task list integration).',
-      },
-      {
-        q: 'Budget versioning — separate system or reuse audit log?',
-        options: [
-          'Separate versioning: dedicated history, cleaner data model.',
-          'Reuse audit log: leverages existing platform, less code.',
-        ],
-        chosen: 'Reuse audit log.',
-        why: 'Audit log already supports version compare, restore, drill-down. Building parallel system would duplicate and create reconciliation headaches. Budget state (Draft/Locked/Version N) overlays cleanly.',
-        tradeoff: 'Audit log designed for ad-hoc edit history, not formal versioning. Some UX work to surface "versions" as first-class.',
+        why: 'Documented cohorts have different starting states. NTTFs have no history. Desktop Migrators split into Fresh Start (no migration) and Importer (PCE cost migrated). Advanced→IES Upgraders sign contract covering migration. Existing IES users have history + memorized reports to consider.',
+        tradeoff: 'Multiple migration paths to build and maintain. Necessary because cohorts have meaningfully different state.',
       },
     ],
     algorithms: [
       {
-        name: 'Virtual scroll with row windowing',
-        description: 'Only DOM-render rows in viewport + N-row buffer. Scroll position calculates window. Row heights memoized. Edit state hoisted out of row components to survive unmount/remount.',
-        complexity: 'O(viewport size) DOM, O(N) memory for data only.',
-        why: 'At 3500 × 23, naive render = 80K+ DOM nodes, browser locks. Virtual scroll keeps DOM bounded to ~50 rows regardless of total.',
+        name: 'DataGrid virtual scroll',
+        description:
+          'Replace paginated view with virtual scroll supporting up to 3500 lines for milestone-driven budgets in V2. Cell edit SLA target <0.2s for 23 columns × 3500 lines.',
+        complexity: 'O(viewport) DOM render.',
+        why: 'Milestone view requires all data of 1 milestone on the same page. Pagination breaks the experience. Virtual scroll keeps DOM bounded regardless of total row count.',
       },
       {
-        name: 'Debounced cell edit + batched state update',
-        description: 'Cell edits debounced 200ms before propagating. Multiple cells batched. React.memo on row components prevents re-render of untouched rows.',
-        complexity: 'O(changed rows) per update.',
-        why: 'Naive update on every keystroke = full grid re-render per char. Unusable. Debounce + memo keeps perf snappy at all sizes.',
-      },
-      {
-        name: 'AI import fuzzy P/S matching',
-        description: 'For each row: tokenize description, fuzzy-match against catalog (Levenshtein + token overlap), score above threshold → suggest, below → "Create new" default. User confirms each row.',
-        complexity: 'O(import rows × catalog size). Async, off main thread.',
-        why: 'Construction P/S catalogs are large; naming varies. Fuzzy suggests, human confirms. Auto-accept = silent miscategorization.',
-      },
-      {
-        name: 'Migration pipeline — async with step-level rollback',
-        description: 'Two-step: (1) accept all pending PEs/COs, (2) migrate cost columns PCE → PB. Step 1 fail → log, surface to user. Step 2 fail → rollback to old mode. Idempotent: re-running picks up from last successful.',
+        name: 'Cohort-driven migration pipeline',
+        description:
+          'Two-step migration: (1) accept all pending PEs/COs, (2) migrate cost columns PCE → PB. Each cohort has documented entry criteria. On-demand migration for cohorts that need user opt-in.',
         complexity: 'O(PEs + COs + lines) per tenant.',
-        why: 'Long-running for large tenants. Async respects UX. Step-level rollback isolates failure. Idempotency allows retry without dirty state.',
+        why: 'Documented constraint: "Existing reports, memorized reports, custom reports must not break." Migration must be deterministic and reversible per cohort policy.',
+      },
+      {
+        name: 'Dimension/Class/Location/Custom field migration per line item',
+        description:
+          'When user triggers migration, PCE line-item-level metadata (dimension, class, location, custom field values) migrates over to PB line by line. Header-level values apply uniformly to all PB lines.',
+        complexity: 'O(line items × metadata fields).',
+        why: 'PB must maintain feature parity with PE for filtering and reporting. Reports filter by dimension/class/location/custom field — PB must support all of them.',
       },
     ],
     numbers: [
-      { metric: 'Adoption rate', value: '27%', note: 'Active IES project users (31% × 86% budgeting users).' },
-      { metric: 'Businesses impacted', value: '~37K', note: 'Active IES with project workflows.' },
-      { metric: 'DataGrid scale', value: '3500 × 23', note: 'Performance target supported in V2.' },
-      { metric: 'Cell edit SLA', value: '<200ms', note: 'Enforced perf budget. Measured.' },
-      { metric: 'Reports affected', value: '8+', note: 'E vs A, E vs A by Project, WIP, Committed Costs, Cost to Complete, Estimate & Progress Invoicing, Transaction List, CO Report.' },
-      { metric: 'Memorized reports impacted', value: '1444+', note: 'Across 6 reports. Required dual-mode + report-level migration messaging.' },
-      { metric: 'Flyway migrations', value: 'Per cohort', note: 'NTTF, DTM (Fresh + Importer), Upgrader (Plus/Advanced w/ or w/o PE), Existing IES (w/ or w/o PE, MC).' },
-      { metric: 'AI import lines supported', value: '300 in V2', note: 'Up from 100 in V1. Async enabled the increase.' },
+      { metric: 'Adoption rate', value: '27%', note: '31% of active project users create PE × 86% of those include costs = 27% adoption of PB.' },
+      { metric: 'Businesses impacted', value: '37K+', note: 'Active IES users with project workflows. 43% IES SAM, accounting for 11% of all IES users.' },
+      { metric: 'DataGrid scale (V2)', value: '3500 rows × 23 cols', note: 'Performance target documented in V2 enhancements.' },
+      { metric: 'Cell edit SLA', value: '<0.2s', note: 'Documented perf budget for DataGrid.' },
+      { metric: 'Memorized reports impacted', value: '1444+', note: 'Across 8 affected reports.' },
+      { metric: 'Spreadsheet baseline', value: '~80% of users', note: 'Use spreadsheets for project budgeting today. PB targets this workflow.' },
     ],
     warStories: [
       {
-        scenario: 'DataGrid perf collapse past 1500 rows',
-        whatHappened: 'Initial implementation rendered all rows on mount. At 1500, scroll froze; at 3000, browser crashed. Construction users routinely have 2000+ line budgets.',
-        howResolved: 'Switched to virtual scroll with windowing. Memoized row components. Lifted edit state. Cell edit SLA dropped from 1.2s → <200ms at 3500.',
-        lesson: 'Always perf-test at upper bound of expected scale. Construction has long tails average tests miss.',
+        scenario: 'Memorized + custom reports must not break',
+        whatHappened:
+          'Documented constraint: 1444+ memorized reports across 8 affected reports carry user expectations. Splitting cost source from PE to PB means cost columns on existing custom reports could go blank silently.',
+        howResolved:
+          'Per requirement: existing reports, memorized reports, and custom reports must not break. Cohort-driven migration with explicit handling for custom reports referencing PE-based cost columns.',
+        lesson:
+          'Long tail of memorized/custom reports must be planned for explicitly. Silent column-blank is not acceptable for financial reports.',
       },
       {
-        scenario: 'Custom report migration ambiguity',
-        whatHappened: 'Tenants had custom reports with "Estimated Cost" column from PCE. After migration, PE no longer carried cost. Column went blank silently.',
-        howResolved: 'Report-level message on affected: "Estimated Cost data moved to Project Budgets." Disabled future creation with PE-based cost columns. Users prompted to switch source.',
-        lesson: 'Long tail of memorized/custom reports needs explicit handling, not silent breakage.',
+        scenario: 'Multiple PEs on one project, single PB constraint',
+        whatHappened:
+          'PRD allows multiple project estimates per project (negotiation iterations) but allows only one budget. Risk: ambiguity about which PE the budget aligns to.',
+        howResolved:
+          'PB is the singular internal cost source. PEs are customer-facing quotes; income aggregates across PEs. Cost flows from PB only. Documented as the financial model: 1 PB : N PEs.',
+        lesson:
+          'Source-of-truth correctness is non-negotiable for financial reporting. One PB per project keeps the model unambiguous.',
       },
       {
-        scenario: 'AI import false matches',
-        whatHappened: 'Fuzzy P/S matching suggested wrong items for similar names. "Consulting" matched "Consultation Fee" at 90% — different income account.',
-        howResolved: 'Lowered confidence threshold. "Create new" as default for ambiguous. Forced user confirmation. Financial accuracy > automation convenience.',
-        lesson: 'AI matching needs human-in-the-loop for financial data. False positives = miscategorized revenue = audit headache.',
+        scenario: 'AI-based spreadsheet import false matches',
+        whatHappened:
+          'Documented design risk: AI matching of imported spreadsheet rows to existing P/S catalog can suggest wrong items for similarly-named entries — different income accounts, different categorization.',
+        howResolved:
+          'AI import requires per-row user confirmation. "Create new" option always available. User cannot bypass confirmation. Financial accuracy prioritized over automation convenience.',
+        lesson:
+          'AI matching for financial data must be human-in-the-loop. Automation without confirmation = silent miscategorization = audit headaches.',
       },
       {
-        scenario: 'Multicurrency block edge case',
-        whatHappened: 'User toggled MC mid-budget-creation. Migration assumed MC off; warning fired but user proceeded. Data partially migrated, partially in old form.',
-        howResolved: 'Hard block on MC toggle when active budget exists (Phase 1). Warning insufficient — block required. Phase 2 added proper MC support.',
-        lesson: 'For financial features with conflicting modes, warning is insufficient when destructive. Block until safe.',
-      },
-      {
-        scenario: 'Migration step 2 failure mid-tenant',
-        whatHappened: 'Tenant\'s step-2 hit unexpected schema variant — non-standard custom field config. Migration stalled.',
-        howResolved: 'Async pipeline detected failure, rolled back to old mode, alerted PD. Manual reconciliation via CSM. Subsequent migration after schema variant handled.',
-        lesson: 'Async pipelines need step-level rollback + alerting. A tenant cannot be left half-migrated.',
+        scenario: 'Downgrade IES → Advanced preserving budget data',
+        whatHappened:
+          'Documented requirement: "Adv → IES migration and IES → Advanced reverse-migration experiences will be seamless as project budgets exist in both products."',
+        howResolved:
+          'Project budgets exist in both products. Migration path documented per cohort including reverse-migration for downgrades.',
+        lesson:
+          'Subscription downgrade paths must preserve user data, not delete it. Cross-product feature parity is the enabling design.',
       },
     ],
     edgeCases: [
-      { case: 'Project with no PE but has PB', handling: 'Reports show estimated cost (from PB), income blank. PE can be added later — independence by design.' },
-      { case: 'PB deleted while reports active', handling: 'Reports show blank Estimated Cost. PE/EI unchanged. Soft delete + warning on delete.' },
-      { case: 'Multiple PEs on same project, one PB', handling: 'PB unchanged. Reports aggregate income across PEs, cost from single PB. By design (1:N for income, 1:1 for cost).' },
-      { case: 'Construction cost codes with hierarchy', handling: 'P/S hierarchy preserved in budget structure. "101 Painting" → "101.1 Floor", "101.2 Ceiling". Reports respect hierarchy for drill-down.' },
-      { case: 'Budget revision changing line counts', handling: 'V2 versioning: Original/Diff/Total columns in reports. Diff can be negative (line removed). Reports reconstruct any version from audit log.' },
-      { case: 'Downgrade from IES → Advanced', handling: 'Synthetic PE created carrying PB cost data; existing PEs unchanged. Reports unbroken. White-glove for edge cases.' },
+      { case: 'Project with no PE but has PB', handling: 'Allowed by design. Reports show estimated cost from PB; income blank. PE can be added later.' },
+      { case: 'PB deleted while reports exist', handling: 'Reports show blank Estimated Cost. PE/EI unchanged. Soft-delete with warning.' },
+      { case: 'Multiple PEs on same project, one PB', handling: 'PB unchanged. Reports aggregate income across PEs; cost from single PB. Documented as 1 PB : N PEs.' },
+      { case: 'Construction cost codes with hierarchy', handling: 'P/S hierarchy preserved in budget structure (e.g., 101 Painting → 101.1 Painting floor, 101.2 Painting ceiling). One level of grouping in MVP. Custom groupings (visual sections) supported.' },
+      { case: 'Budget period changed', handling: 'Period editable post-creation. Does not modify project start/end dates (common because projects often run over schedule).' },
+      { case: 'Dimension / Class / Location / Custom field migration', handling: 'Line-item-level values migrate line by line. Header-level values apply uniformly to all PB lines. All filterable in Estimate vs Actual and other reports.' },
+      { case: 'Budget templates', handling: 'MVP: "duplicate" or "copy" only. Users copy existing budget and edit. Note: duplicate exists for P&L/B/S in Advanced; enabled only in IES for project budgets in MVP.' },
+      { case: 'Budget comments', handling: 'Row-level comments supported (extension of existing P&L/B/S comment feature). Cell-level deferred. Manual tracking via comments until full versioning ships.' },
     ],
     whatIWouldChange:
-      '(1) Migration pipeline observability from day one. (2) Test custom/memorized reports earlier — discovered the long-tail late. (3) Build AI matching as confidence-banded UX from the start instead of single-threshold tuned later. (4) Multicurrency in V1 — blocking 0.38% felt right but created Phase-2 catch-up cost.',
+      'Retrospective opinion only. Possibilities: build full budget versioning system earlier instead of relying on comments; build dual-mode reporting observability from day one; deeper AI confidence-banding for import. Verify before claiming as fact.',
     chains: [
       {
-        title: 'The source-of-truth migration chain',
+        title: 'The source-of-truth chain',
         steps: [
-          { q: 'Why decouple cost from income?', a: 'Different audiences, different granularity. Construction: 200+ cost codes internally, 10 to customer. PE conflates these.' },
-          { q: 'How do reports know which source to use?', a: 'Dual-mode during rollout: PB users see new, non-PB users see old. Feature flag drives the choice.' },
-          { q: 'What happens to memorized reports?', a: '1444+ memorized across 6 reports. Migration shows report-level message. Custom reports with PE-cost columns get inline warning.' },
-          { q: 'When is dual-mode retired?', a: 'After 100% migration. In-product migration + CSM outreach + auto-migrate after cutoff.' },
-          { q: 'What if a tenant cannot migrate?', a: 'Step 2 failure rolls back to old mode. PD alerted. Manual reconciliation. No half-migrated state.' },
+          { q: 'Why decouple PB from PE?', a: 'Two audiences: internal accountant (granular cost-code level) vs customer (high-level quote). PE conflated them. PB is the singular internal cost source; PE remains the income/quote document.' },
+          { q: 'Why one PB per project but multiple PEs?', a: 'Cost source must be singular for unambiguous reporting. Income iterates through negotiation — multiple PEs reflect that. 1 PB : N PEs.' },
+          { q: 'How do reports know to use PB or PE for cost?', a: 'PB is the source of truth for Estimated cost in all reports. PE no longer carries cost columns (your rate / your total removed in PE).' },
         ],
       },
       {
-        title: 'The DataGrid scale chain',
+        title: 'The migration cohorts chain',
         steps: [
-          { q: 'How do you handle 3500 rows?', a: 'Virtual scroll with windowing — only ~50 rows in DOM. Row components memoized. Edit state hoisted.' },
-          { q: 'What\'s your cell edit SLA?', a: '<200ms. Enforced as perf budget. Debounced + batched updates keep us inside.' },
-          { q: 'What breaks first at 10× scale?', a: 'Server-side aggregation for milestone rollups. Currently client; would move to server with materialized rollup.' },
-          { q: 'How did you measure cell edit latency?', a: 'Perf instrumentation: mark before edit, mark after re-render. Aggregated p50/p95/p99. Alerts on regression.' },
+          { q: 'How many migration paths?', a: 'NTTFs, Desktop Migrators (Fresh Start + Importer), Advanced→IES Upgraders, Existing IES users.' },
+          { q: 'Why cohort-specific?', a: 'Each cohort has different starting state. NTTFs no history. Importers bring PCE cost data. Upgraders signed contract covering migration. Existing IES have memorized reports + workflow expectations.' },
+          { q: 'How are memorized reports protected?', a: 'Documented constraint: existing reports, memorized reports, custom reports must not break. 1444+ memorized reports across 8 affected reports are explicitly considered in migration planning.' },
+          { q: 'Downgrade path?', a: 'IES → Advanced reverse-migration seamless because project budgets exist in both products.' },
         ],
       },
       {
-        title: 'The cohort migration chain',
+        title: 'The DataGrid perf chain',
         steps: [
-          { q: 'Why three migration paths?', a: 'Cohorts have different starting states. NTTF: no history. Upgraders: contract-signed migration. Existing IES: history + memorized reports + workflow expectations.' },
-          { q: 'What about Desktop migrators?', a: 'Two sub-cohorts: Fresh Start (auto-new experience) and Importer (PCE cost migrated to PB during migration).' },
-          { q: 'How do you handle a tenant that opts in then changes mind?', a: 'One-way after cutoff. Pre-cutoff: white-glove rollback for exceptional cases. Documented and gated.' },
-          { q: 'What\'s the cutoff strategy?', a: 'In-product nudges + CSM outreach ~3 months. Auto-migrate at cutoff. Sunset old after 100% on PB.' },
+          { q: 'How does the budget UI handle 3500 lines?', a: 'V2 introduces virtual scroll replacing the paginated view to support milestones with all data on one page. Cell edit SLA target <0.2s for 23 columns × 3500 lines.' },
+          { q: 'Why pagination didn\'t work?', a: 'Milestones require all data of one milestone on the same page. Pagination broke the user experience for that flow.' },
+          { q: 'What FP&A component is reused?', a: 'The DataGrid used for P&L and B/S budgets. Reuse aligns UX across budget types.' },
         ],
       },
     ],
   },
   'cms-migration': {
     framing:
-      'Probed on distributed-systems instinct: timeout handling, idempotency, reconciliation, and the gap between "API returned" and "system state changed."',
+      'Distributed-systems project with documented FMEAs. Failure modes below are taken from your FMEA doc — they are scenarios designed for, not necessarily incidents that occurred. Frame as "scenarios our design accounts for" in interviews, not "things that happened."',
     decisions: [
       {
-        q: 'API vs event-based for project ↔ sub-customer sync?',
+        q: 'API-based vs event-based for project ↔ CMS sub-customer sync?',
         options: [
-          'Event-driven: eventual consistency, decoupled.',
-          'API-based (sync CMS call from Projects): strong consistency for user action, more coupling.',
+          'API-based (sync): low effort, stronger consistency for user actions, medium FMEAs.',
+          'Event-based: medium effort, fewer FMEAs, but eventual consistency for txn updates.',
         ],
-        chosen: 'API-based.',
-        why: 'User-facing create/update needs strong consistency. Event-driven leaves observable windows where Project exists without sub-customer — users would see project but not be able to invoice it. API gives clear outcome per action.',
-        tradeoff: 'Timeout ambiguity. Solved via idempotency + correlation-id reconciliation, not by accepting eventual consistency.',
+        chosen: 'API-based (Approach #1).',
+        why: 'Based on discussion with CMS team. User-facing create/update needs strong consistency. Approach #1 had lower effort, comparable closeness to target state, and acceptable FMEA profile.',
+        tradeoff: 'Timeout-causes-inconsistency FMEAs require explicit handling. Reconciled via idempotency + retry/compensation paths.',
       },
       {
-        q: 'On CMS timeout — rollback project, retry, or reconcile?',
+        q: 'On API timeout — retry blindly or reconcile?',
         options: [
-          'Rollback project: clean state, lose user action when CMS may have succeeded.',
-          'Retry blindly: may cause duplicates.',
-          'Reconcile: query CMS by correlation, then decide.',
+          'Treat timeout as failure: rolls back project, loses successful CMS work.',
+          'Treat timeout as "unknown": reconcile via follow-up reads + compensating actions.',
         ],
         chosen: 'Reconcile.',
-        why: 'Treating timeout as failure throws away successful work. Reconciliation via correlation-id determines actual CMS state, then finalizes project (CMS succeeded) or retries idempotently (CMS failed).',
-        tradeoff: 'More code surface — reconciliation logic, correlation tracking, eventual-consistency window. Worth it to preserve user intent.',
+        why: 'Your design: "We stopped treating timeout as failure. We treated it as \'unknown\', then reconciled via idempotency + follow-up reads + compensating actions." Every request carries correlation ID / transaction ID.',
+        tradeoff: 'More code surface (reconciliation paths, correlation tracking). Necessary to preserve user intent across transient infra issues.',
       },
       {
-        q: 'Downstream eventual consistency — fight it or accept it?',
+        q: 'Legacy v4 fallback events — keep or remove?',
         options: [
-          'Synchronous propagation everywhere: impossible at scale of 350+ downstream consumers.',
-          'Accept eventual consistency for downstreams (QBTime, STS, ETS, FTS).',
+          'Keep as fallback: defense in depth, dual paths.',
+          'Remove: single authoritative sync path via CMS API.',
         ],
-        chosen: 'Accept eventual consistency for downstreams.',
-        why: 'Project ↔ CMS must be strongly consistent (user action). Downstream projections are eventually consistent by design. Trying to make everything sync breaks scalability.',
-        tradeoff: 'Users may briefly see "no transactions" right after converting sub-customer to project. Mitigated with UX guidance to refresh + consumer lag monitoring.',
+        chosen: 'Remove v4 fallback.',
+        why: 'Per your prep guide: "you improved consistency by removing the legacy fallback event path and making a single authoritative sync path, plus observability + compensations to drive failure rate down." Two sync paths cause drift.',
+        tradeoff: 'Lose dual-path redundancy. Replaced with idempotency + reconciliation for safety.',
       },
     ],
     algorithms: [
       {
-        name: 'Idempotent CMS API on project key',
-        description: 'Every CMS create/update carries projectId (or client-generated idempotency token). CMS deduplicates: if sub-customer for projectId exists, return existing rather than creating duplicate.',
-        complexity: 'O(1) dedup lookup.',
-        why: 'Without idempotency, retries on timeout create duplicate sub-customers. With it, retries are safe.',
+        name: 'Correlation-id-based reconciliation',
+        description:
+          'Every CMS API request carries a correlation ID / transaction ID. On timeout: treat outcome as unknown. Follow-up read against CMS using the correlation ID determines actual state. If sub-customer exists → finalize project. If not → idempotent retry.',
+        complexity: 'O(1) per reconciliation.',
+        why: 'Distributed systems cannot distinguish "request lost" from "response lost." Correlation ID enables outcome determination after timeout.',
       },
       {
-        name: 'Correlation-id reconciliation',
-        description: 'On timeout: (1) short backoff, (2) query CMS by correlation-id, (3a) if exists → finalize project, (3b) if not → retry idempotent call. Persistent reconciliation queue for sustained timeouts.',
-        complexity: 'O(1) per reconciliation, async.',
-        why: 'Treats timeout as "unknown" not "failure." Preserves user intent across transient infra issues.',
+        name: 'Observability instrumentation (DWSM + consumer lag)',
+        description:
+          'End-to-end tracing enabled via DWSM. Consumer lag monitors for downstream consumers (QBTime, STS/ETS/FTS) so eventual-consistency delays surface as alerts, not silent staleness.',
+        complexity: 'Standard instrumentation.',
+        why: 'Without consumer lag monitoring, users hit stale projection views and the system surface looks broken. Lag monitors expose the eventual consistency window for operators to manage.',
       },
     ],
     numbers: [
-      { metric: 'Sync failure reduction', value: '~95%', note: 'Pre-migration drift detection vs post-migration cross-service consistency monitor.' },
-      { metric: 'Removed legacy paths', value: 'Monolith sync + v4 fallback event', note: 'Both replaced by single CMS API with idempotency.' },
-      { metric: 'Affected downstreams', value: 'CERES, Audit, QBTime, STS, ETS, FTS', note: 'Plus 350+ DL consumers via batch ingestion.' },
+      { metric: 'Sync failure reduction', value: '~95%', note: 'Achieved by removing legacy fallback event path + single authoritative sync path + observability + compensations.' },
+      { metric: 'Removed legacy paths', value: 'Monolith APIs + v4 fallback event', note: 'Both replaced by single CMS API with idempotency.' },
+      { metric: 'Affected downstreams', value: 'QBTime, STS, ETS, FTS, BKTS', note: 'Per-consumer lag monitors documented in FMEAs.' },
     ],
     warStories: [
       {
-        scenario: 'Timeout ambiguity in production',
-        whatHappened: 'CMS create timed out. Project was rolled back. But CMS had actually succeeded — a sub-customer existed without a project pointing at it.',
-        howResolved: 'Built the reconciliation flow: on timeout, query CMS by correlation-id before rolling back. Backfilled orphaned sub-customers in one-time job.',
-        lesson: 'In distributed systems, "no response" is not the same as "no action taken." Always reconcile before destructive cleanup.',
+        scenario: 'FMEA: API to create sub-customer times out',
+        whatHappened:
+          'Documented failure scenario: API times out after sub-customer creation. User sees FCI that project creation failed. However sub-customer is created and appears in quickfills/sales forms. User could create txns with that project, but Project details would error. Project would not appear on Project List Page.',
+        howResolved:
+          'DWSM enabled for end-to-end flow tracing. Correlation ID enables post-timeout reconciliation. Idempotent CMS API ensures retries do not duplicate sub-customers.',
+        lesson:
+          'In distributed systems, "no response" is not "no action taken." Always reconcile before destructive cleanup.',
       },
       {
-        scenario: 'Parent move with partial state corruption',
-        whatHappened: 'User moved project to a new parent customer. CMS updated; Projects API timed out. Reports referencing old parent got stale.',
-        howResolved: 'FMEA flagged pre-launch. Compensation: query CMS state, surface mismatch alert, manual reconciliation tooling for affected reports.',
-        lesson: 'Cross-service updates with structural impact need explicit FMEA, not just retry logic.',
+        scenario: 'FMEA: Update project to change sub-customer times out',
+        whatHappened:
+          'User updates project to change parent customer. CMS update API times out. User sees update-failed message. But sub-customer is updated with new parent customer. Reports for that customer get corrupted because sub-customer has moved.',
+        howResolved:
+          'DWSM tracing surfaces the discrepancy. Per your prep guide, this is documented as "the nastiest FMEA in your doc (reports corruption)." Compensation flow surfaces mismatch via alerts; manual reconciliation tooling addresses corrupted reports.',
+        lesson:
+          'Cross-service updates with structural impact (parent moves) need explicit FMEA. Retry logic alone is insufficient for hierarchy changes.',
+      },
+      {
+        scenario: 'FMEA: User converts sub-customer to project, immediately opens project details',
+        whatHappened:
+          'Documented scenario: user converts sub-customer to project and quickly opens project details. Delay in Project create event consumption in QBTime → no time activities visible. Same for STS/ETS/FTS → no transactions visible.',
+        howResolved:
+          'Monitor consumer lag in QBTime, STS, ETS, BKTS with proper alerting. UX guidance: refresh page. DWSM trace end-to-end flow.',
+        lesson:
+          'Eventual consistency for downstream projections is acceptable, but the window must be observable and the user must be guided.',
+      },
+      {
+        scenario: 'FMEA: Project activation/inactivation times out',
+        whatHappened:
+          'Documented: API to activate/inactivate sub-customer times out. User sees failure message. But sub-customer gets activated/inactivated. Quickfills + transactions show incorrect data.',
+        howResolved:
+          'DWSM tracing. Reconciliation via correlation ID determines actual state. Idempotency ensures retry safety.',
+        lesson:
+          'Boolean state toggles have the same timeout problem as creates/updates. Reconciliation must cover all state-mutation surfaces, not just creates.',
       },
     ],
     edgeCases: [
-      { case: 'Sub-customer convert + immediate transaction lookup', handling: 'Downstream consumer lag means transactions may not show immediately. UX guidance: refresh. Lag monitored.' },
-      { case: 'CMS API down for extended period', handling: 'Project create/update fails fast. User sees explicit error. Once CMS recovers, queue drains.' },
-      { case: 'Idempotent retry from different application server', handling: 'Idempotency key is projectId, not server. Any server retrying produces same call. CMS dedupes.' },
+      { case: 'Idempotent retry from different application server', handling: 'Idempotency key is the projectId, not the calling server. Any server retrying produces the same call. CMS dedupes.' },
+      { case: 'CMS API extended outage', handling: 'Project create/update fails fast with explicit error. Reconciliation queue drains once CMS recovers.' },
+      { case: 'Reports corruption from parent-customer move timeout', handling: 'DWSM trace + compensation alert. Manual reconciliation tooling for affected reports. Documented as a high-severity FMEA.' },
+      { case: 'Downstream consumer lag visible to user', handling: 'UX guidance: refresh page. Consumer lag monitors with alerting for operators.' },
     ],
     whatIWouldChange:
-      'Build the FMEA before implementation, not alongside. Caught parent-move ambiguity late. Better observability on reconciliation queue — dashboard from day one rather than Splunk query.',
+      'Retrospective opinion only. Possibilities: build the FMEA before the implementation, not alongside; reconciliation queue dashboard from day one. Mark as your view.',
     chains: [
       {
-        title: 'The timeout-ambiguity chain',
+        title: 'The timeout-handling chain',
         steps: [
-          { q: 'CMS times out. What does your code do?', a: 'Wait, query CMS by correlation-id. If sub-customer exists, finalize project. If not, retry idempotent.' },
-          { q: 'What if reconciliation also times out?', a: 'Persistent reconciliation queue. Backoff + retry. Alert if queue grows.' },
-          { q: 'How do you prevent duplicate sub-customers across retries?', a: 'CMS API is idempotent on projectId. Same projectId → same sub-customer.' },
-          { q: 'What proves "95% fewer failures"?', a: 'Pre: drift detector ran daily, counted mismatches. Post: cross-service consistency monitor, real-time. 95% reduction comparing daily averages.' },
+          { q: 'CMS API times out. What does your code do?', a: 'Treat as unknown. Follow-up read via correlation ID determines actual state. If sub-customer exists → finalize project. If not → idempotent retry.' },
+          { q: 'How do you prevent duplicate sub-customers on retry?', a: 'CMS API is idempotent on projectId. Same key → same sub-customer.' },
+          { q: 'What if reconciliation also times out?', a: 'Persistent reconciliation queue. Backoff + retry. Alert if queue depth grows.' },
+          { q: 'What proves the 95% sync-failure reduction?', a: 'Pre-state: drift detector counted daily mismatches across legacy paths. Post-state: cross-service consistency monitor shows real-time mismatch count. 95% reduction is the comparison.' },
+        ],
+      },
+      {
+        title: 'The eventual-consistency tradeoff chain',
+        steps: [
+          { q: 'Why is the user-facing CMS sync strongly consistent but downstreams eventually consistent?', a: 'User-facing action requires immediate visibility of outcome. Downstream projections (time tracking, transaction references) are eventual by design — making them sync would not scale.' },
+          { q: 'How long is the inconsistency window?', a: 'Bounded by consumer lag. Monitored per consumer. Alerts fire above threshold.' },
+          { q: 'What does the user see?', a: 'For just-converted project, no time activities or transactions until consumer catches up. UX guidance: refresh.' },
+          { q: 'What about reports referencing the moved customer?', a: 'Reports corruption is the nastiest documented FMEA. DWSM trace + compensation flow + manual reconciliation tooling.' },
         ],
       },
     ],
   },
   'au-launch': {
     framing:
-      'Probed on cross-team execution, risk surfacing, and what you owned vs participated in. They want to see leadership without authority.',
+      'Cross-team execution at market scale. Probed on coordination, risk surfacing, and leadership without authority. Be specific about what you owned vs participated in. Stripped of fabricated bug stories from earlier draft.',
     decisions: [
       {
         q: 'Why launch with no marketing?',
         options: [
           'Full marketing launch: max influx, max risk if anything breaks.',
-          'Soft launch (no active marketing): smaller initial cohort, lower support pressure, time to validate.',
+          'Soft launch: smaller cohort, lower support pressure, time to validate.',
         ],
         chosen: 'Soft launch.',
-        why: 'AU is a new market with established competitors (Xero, MYOB). First impression matters. Soft launch lets us validate stability under real AU traffic before scaling marketing. Marketing follows confidence.',
-        tradeoff: 'Slower initial adoption. Acceptable because botched launch risk in competitive market > slower ramp.',
+        why: 'New market with established competitors (Xero, MYOB). First impression matters. Soft launch lets product stability validate under real AU traffic before scaling marketing. Marketing follows confidence.',
+        tradeoff: 'Slower initial adoption. Acceptable: a botched launch in a competitive market is worse than slower ramp.',
       },
       {
-        q: 'Which features were gating for GA?',
+        q: 'Feature scope for GA — full Advanced parity or pragmatic subset?',
         options: [
-          'All Advanced features: max parity, latest delivery.',
-          'Core features + safe upgrade/downgrade + analytics: pragmatic GA.',
+          'All Advanced features at GA: maximum parity.',
+          'Core + safe upgrade/downgrade + analytics correctness.',
         ],
         chosen: 'Core + upgrade safety + analytics.',
-        why: 'Upgrade/downgrade safety non-negotiable. Analytics correctness critical for mid-market (target segment). Other features can follow post-GA. Gating on what matters.',
+        why: 'Upgrade/downgrade safety non-negotiable for mid-market customers. Analytics correctness critical for the target segment. Other features follow post-GA.',
         tradeoff: 'Some feature gaps at GA. Documented in known-issues. Roadmap visible to early adopters.',
       },
     ],
     algorithms: [
       {
         name: 'Cross-team readiness gating',
-        description: 'Each dependent team owns a feature gate. Pre-Oct-27 cutoff: all green or descoped. Daily readiness sync. Issue triage with severity tiers. No GA until P0/P1 gates green.',
+        description:
+          'Each of 10+ dependent teams owns a feature gate. Pre-Oct-27 cutoff: all gates green or features descoped. Daily readiness sync. Issue triage with severity tiers. No GA until P0/P1 gates green.',
         complexity: 'O(features × teams) coordination surface.',
-        why: 'Mis-sequenced enablement = silent data corruption or upgrade lock. Explicit gating prevents "works on my machine" surprises.',
-      },
-      {
-        name: 'Analytics correctness validation',
-        description: 'Pre-GA: run analytics pipelines against AU-shaped test data. Spot-check key metrics for sensible values. Compare against expected ranges from US/UK/CA (adjusted for AU patterns).',
-        complexity: 'Per-pipeline validation, bounded by AU test data size.',
-        why: 'Analytics drift in new market is invisible until it hurts. Validation catches schema/value drift before customers see wrong dashboards.',
+        why: 'Mis-sequenced enablement risks silent data corruption or upgrade lock. Explicit per-team gating prevents "it works on my machine" surprises.',
       },
     ],
     numbers: [
@@ -1814,293 +1846,294 @@ const DEEP_DIVES = {
       { metric: 'AU subscriber base', value: '~250K', note: 'Pre-launch QBO subscriber count. Strong upgrade opportunity to Advanced.' },
       { metric: 'Launch date', value: 'December 4', note: 'GA with no active marketing.' },
       { metric: 'Pre-prod cutoff', value: 'October 27', note: 'All feature gates green or descoped by this date.' },
-    ],
-    warStories: [
-      {
-        scenario: 'Late-breaking locale bug',
-        whatHappened: 'Pre-prod testing surfaced AU-specific currency formatting bug — showed USD symbol instead of AUD in specific edge path.',
-        howResolved: 'Owning team identified within 2 days, fix backported, re-validated. Gating worked: surfaced pre-GA.',
-        lesson: 'Locale bugs are silent until validated against locale-specific data. Test data shape matters more than volume.',
-      },
-      {
-        scenario: 'Upgrade flow soft-blocker miss',
-        whatHappened: 'Specific upgrade path (Plus → Advanced AU) hit unexpected soft blocker due to legacy AU config. Surfaced during accountant-flow testing.',
-        howResolved: 'Team patched the soft-blocker condition. Re-tested upgrade path. Added to upgrade smoke test suite.',
-        lesson: 'Upgrade matrices have long tails. Every cohort path needs explicit test coverage; matrix is part of gating.',
-      },
+      { metric: 'Target segment', value: 'Mid-market', note: 'Construction and professional services emphasis.' },
     ],
     edgeCases: [
-      { case: 'AU-only feature dependency timing', handling: 'Sequenced after global-feature enablement. If global delayed, AU launch path adjusted. Explicit dependency graph.' },
-      { case: 'Mid-market customer with existing third-party tools', handling: 'Migration path documented. Not gating for GA — migration support is post-GA work. Disclosed.' },
+      { case: 'AU-only feature dependency timing', handling: 'Sequenced after global-feature enablement. If global delayed, AU launch path adjusted (descope or wait). Explicit dependency graph.' },
+      { case: 'Mid-market customer with existing third-party tools', handling: 'Migration path documented. Not gating for GA — migration support is post-GA work.' },
+      { case: 'Upgrade matrix coverage', handling: 'Every cohort path (Simple Start, Essentials, Plus → Advanced AU) tested. Soft-blocker conditions in legacy AU configs validated.' },
     ],
     whatIWouldChange:
-      'Earlier locale test data setup. We had AU companies in pre-prod, but scenario diversity was thin until late. Next time: build AU test data set in parallel with feature work, not after.',
+      'Retrospective opinion only. Possibility: build AU test data set in parallel with feature work, not after. Verify before claiming.',
     chains: [
       {
         title: 'The cross-team execution chain',
         steps: [
           { q: 'How did you sequence 10+ teams?', a: 'Per-feature dependency graph + per-team readiness gate. Daily sync. P0/P1 triaged within 24h.' },
-          { q: 'What was the riskiest path?', a: 'Upgrade/downgrade. Soft blockers in legacy AU configs could lock customers or corrupt data. Gated hardest.' },
-          { q: 'What would have caused rollback?', a: 'Analytics drift on a key metric. Validated pre-GA precisely to avoid.' },
-          { q: 'What did you personally drive?', a: 'Sequencing + readiness gates for Projects/IES slice. Personally validated upgrade/downgrade and analytics correctness. Escalation owner for cross-team blockers.' },
+          { q: 'What was the riskiest path?', a: 'Upgrade/downgrade. Soft blockers in legacy AU configs could lock customers in or corrupt data. Gated hardest.' },
+          { q: 'What would have caused rollback?', a: 'Analytics drift on key metric, upgrade-path corruption, or critical region-specific bug. Validated pre-GA precisely to avoid.' },
+          { q: 'What did you personally drive?', a: 'Sequencing + readiness gates for Projects/IES slice. Personal validation of upgrade/downgrade and analytics correctness for our area. Escalation owner for cross-team blockers.' },
         ],
       },
     ],
   },
   'template-sharing': {
     framing:
-      'Probed on platform thinking, not just frontend execution. They will push on extensibility, safety (PII), and multi-service orchestration.',
+      'Frontend-led with platform-thinking implications. Your source describes the WAS → UCS publish ordering, PII masking with dot-dash, and share scopes. Failure modes below are scenarios the design accounts for, not historical incidents.',
     decisions: [
       {
-        q: 'Workflow-specific template feature or cross-plugin platform?',
+        q: 'Workflow-specific feature or plugin-agnostic platform?',
         options: [
-          'Workflow-only: faster ship, must rebuild for next plugin.',
-          'Plugin-agnostic platform: more upfront design, reusable for reports/spreadsheets.',
+          'Workflow-only: faster ship, rebuild per plugin.',
+          'Plugin-agnostic: shared publish/discovery flow across plugins.',
         ],
         chosen: 'Plugin-agnostic platform.',
-        why: 'Templates are a category, not a feature. Same publishing/discovery/contribution flow applies to workflows, reports, spreadsheet sync. Building once for many beats rebuilding per plugin.',
-        tradeoff: 'Higher upfront design cost. Pays back the first time a sibling team uses the framework.',
+        why: 'Templates are a category, not a single-plugin feature. Same publishing/discovery flow can serve future plugins. Build once for many.',
+        tradeoff: 'Higher upfront design cost. Pays back as additional plugins adopt the framework.',
       },
       {
-        q: 'PII handling — client-side scrub, server-side scrub, or both?',
+        q: 'PII masking — where to enforce?',
         options: [
-          'Client-side only: surface to user, no server enforcement.',
-          'Server-side only: hides masked data until server-side reject.',
-          'Both (defense in depth).',
+          'Client-side only.',
+          'Server-side only.',
+          'Both.',
         ],
-        chosen: 'Both.',
-        why: 'Client-side mask gives immediate visual feedback. Server-side validation enforces correctness. Either alone leaves a gap.',
-        tradeoff: 'Duplicate logic. Acceptable because financial templates demand zero leak tolerance.',
+        chosen: 'Client-side masking with dot-dash representation.',
+        why: 'Templates published to community/companies/clients must not leak tenant data. Dot-dash visualization gives the publisher immediate feedback that values are scrubbed.',
+        tradeoff: 'Client-side enforcement alone has gaps without server backstop. Note: I do not have detail from your source on server-side validation specifics — verify before claiming.',
       },
       {
-        q: 'Publish flow — multi-service orchestration: client or server?',
+        q: 'Publish flow — order of WAS and UCS calls?',
         options: [
-          'Client orchestrates (WAS then UCS): simpler, fragile to partial failure.',
-          'Server orchestrates: transactional semantics, more backend coordination.',
+          'UCS first then WAS: backwards causality.',
+          'WAS first (persist workflow definition) then UCS (publish template metadata).',
         ],
-        chosen: 'Client orchestrates with strict ordering and UI rollback.',
-        why: 'Time-to-ship favored client orchestration. WAS persist is durable step; UCS publish references WAS entity. Failure at UCS surfaces as retryable; client UI reflects partial state cleanly.',
-        tradeoff: 'Less robust than server-side transaction. Documented and monitored. Future migration to server orchestration possible.',
+        chosen: 'WAS → UCS.',
+        why: 'UCS template metadata references the persisted workflow. UCS-first would create unreferenceable template entries. Sequential dependency drives ordering.',
+        tradeoff: 'WAS-success-then-UCS-failure leaves an orphan workflow that needs explicit handling.',
       },
     ],
     algorithms: [
       {
         name: 'Multi-step publish orchestration',
-        description: 'Sequence: (1) enter publish mode → mask PII, hide workflow-specific UI, (2) collect template metadata, (3) call WAS to persist workflow definition, (4) on WAS success → call UCS to publish template metadata, (5) on UCS success → navigate to My Workflows + reset UI. Failure rolls back UI to safe state.',
+        description:
+          'Sequence: (1) enter publish mode → mask PII (dot-dash), hide workflow-specific UI; (2) collect template metadata; (3) call WAS to persist workflow definition; (4) on WAS success → call UCS to publish template metadata; (5) on UCS success → navigate to discovery view + reset UI.',
         complexity: 'O(1) sequential steps.',
-        why: 'Sequential dependency: UCS references WAS workflow. UCS-first would create orphans. Strict order + UI rollback keeps state coherent.',
-      },
-      {
-        name: 'PII masking with regex + field-list',
-        description: 'On entering publish mode: scan workflow definition for known PII fields (name, address, email) + regex (SSN, account numbers). Mask with dot-dash. Server-side validator rejects PII patterns.',
-        complexity: 'O(fields × patterns) per scan.',
-        why: 'Templates leak data when published carelessly. Client mask + server validation = defense in depth.',
+        why: 'UCS references WAS workflow entity. Reverse ordering creates orphan template entries. Strict order preserves referential integrity.',
       },
     ],
     numbers: [
-      { metric: 'Users publishing templates', value: '1K+', note: 'Across QBO Advanced + Accountant tenants.' },
-      { metric: 'Setup time reduction', value: '~60%', note: 'Measured on tenants using shared templates vs creating from scratch.' },
-      { metric: 'Plugin extensibility', value: 'Plugin-agnostic platform', note: 'Future plugins extend via Template Handler contract.' },
+      { metric: 'Users publishing templates', value: '1K+', note: 'Across tenants using the feature.' },
+      { metric: 'Setup time reduction', value: '~60%', note: 'For tenants using shared templates vs creating from scratch.' },
+      { metric: 'Share scopes', value: '3', note: 'community / my companies / my clients.' },
     ],
     warStories: [
       {
-        scenario: 'PII leak in early prototype',
-        whatHappened: 'Early review: published template still carried customer name in description field. Client mask missed it.',
-        howResolved: 'Expanded field-list. Added server-side regex validation as last-line defense. Re-scanned existing published and re-masked detected PII.',
-        lesson: 'PII detection must be exhaustive and tested adversarially. One miss = trust gone.',
+        scenario: 'WAS success + UCS failure leaving orphan workflow',
+        whatHappened:
+          'Documented risk in the publish flow: WAS persists workflow definition successfully, UCS template-publish fails (transient infra issue). Result: workflow exists in WAS without a discoverable template in UCS.',
+        howResolved:
+          'Retry surfaced to user. On retry, UCS call repeats with the same WAS reference (idempotent on workflow key — no duplicate created). For sustained failures, an orphan-cleanup sweep can address WAS entries without UCS references.',
+        lesson:
+          'Multi-service publish flows need explicit retry semantics and orphan cleanup. Silent retries on the client cause confusion.',
       },
       {
-        scenario: 'WAS success + UCS failure leaving orphan',
-        whatHappened: 'WAS persisted workflow definition, UCS publish failed (transient infra). Orphan workflow definition in WAS, no template in UCS.',
-        howResolved: 'Surfaced retry CTA to user. On retry, UCS call repeated with same WAS reference. No duplicate workflow created. Orphan cleanup job for sustained failures.',
-        lesson: 'Cross-service orchestration needs explicit retry semantics, not silent retries. User must understand state.',
+        scenario: 'PII visibility for the publisher',
+        whatHappened:
+          'Templates are tenant-published but consumed across tenants. Without masking, tenant-specific values (customer names, emails, account references) would appear in shared templates.',
+        howResolved:
+          'On entering publish mode, sensitive values are masked client-side using dot-dash representation so the publisher sees what consumers will see.',
+        lesson:
+          'For cross-tenant sharing, masking is a publisher-facing trust signal, not just a data-protection mechanism.',
       },
     ],
     edgeCases: [
-      { case: 'User closes browser mid-publish', handling: 'WAS may have succeeded, UCS may not. Orphan cleanup sweeps WAS workflows without UCS references after threshold. User can re-publish — idempotent on workflow key.' },
-      { case: 'Template imported on incompatible workflow engine version', handling: 'Template carries schema version. Import validates. Mismatch shows compatibility warning + migration path.' },
-      { case: 'Publish to "community" vs "my companies" vs "my clients"', handling: 'Share-with scope captured at publish time. UCS enforces visibility on discovery. Community templates public; my-companies/my-clients scoped.' },
+      { case: 'User closes browser mid-publish', handling: 'WAS may have succeeded, UCS may not. Orphan cleanup eventually sweeps WAS workflows without UCS references. User can re-publish (idempotent on workflow key).' },
+      { case: 'Share scope selection', handling: 'Three scopes captured at publish time: community / my companies / my clients. UCS enforces visibility on discovery accordingly.' },
+      { case: 'Multi-plugin extensibility', handling: 'Future plugins (reports, spreadsheets) extend via a Template Handler contract with core fields + plugin-specific extension map.' },
     ],
     whatIWouldChange:
-      '(1) Server-side orchestration from day one — client-side was faster but more fragile. (2) Template versioning earlier — V1 didn\'t version; first workflow engine update caused compatibility issues. (3) PII scan as a standalone service, not embedded in publish flow — reusable for other surfaces.',
+      'Retrospective opinion only — verify before claiming. Possibilities: server-side orchestration with transactional semantics (vs client-orchestrated); explicit template versioning earlier; standalone PII scrub service reusable across surfaces.',
     chains: [
       {
         title: 'The platform-extensibility chain',
         steps: [
-          { q: 'How does this extend to reports?', a: 'Template Handler is plugin-agnostic. Reports plugin implements same metadata contract. Discovery + publishing UX reused.' },
-          { q: 'What if reports need different metadata fields?', a: 'Contract has core fields + plugin-specific extension map. Reports adds its fields without changing core.' },
-          { q: 'How do you prevent the platform from becoming workflow-specific?', a: 'Code review discipline. Workflow-specific stays in workflow plugin. Platform has own test suite running without workflow context.' },
+          { q: 'How does this extend to a new plugin?', a: 'Template Handler is plugin-agnostic. New plugin implements the metadata contract. Discovery + publishing UX reused.' },
+          { q: 'What if a new plugin needs different metadata?', a: 'Core fields + plugin-specific extension map. New plugin adds its fields without changing core.' },
+          { q: 'How do you prevent the platform from drifting workflow-specific?', a: 'Code review discipline. Workflow-specific logic stays in the workflow plugin. Platform has its own test surface.' },
         ],
       },
       {
-        title: 'The PII safety chain',
+        title: 'The publish-flow consistency chain',
         steps: [
-          { q: 'How do you prevent PII leaks?', a: 'Client mask (dot-dash) + server-side validator. Both required.' },
-          { q: 'What if a new PII field is added?', a: 'Field-list maintained centrally. New fields added before they ship. Server validator falls back to regex for known patterns.' },
-          { q: 'What if a user types a customer name into a description?', a: 'Regex catches common patterns. For free-text, additional review prompt on publish. Not perfect — documented and monitored.' },
+          { q: 'Why does WAS publish before UCS?', a: 'UCS template metadata references the persisted workflow. UCS-first would create orphan template entries.' },
+          { q: 'What if UCS fails after WAS succeeds?', a: 'Retry CTA surfaced to user. UCS call repeats with same WAS reference. Idempotent on workflow key — no duplicates.' },
+          { q: 'What about repeated UCS failures?', a: 'Orphan cleanup sweep can address WAS entries without UCS references after a threshold.' },
         ],
       },
     ],
   },
   'consolidated-email': {
     framing:
-      'Probed on preference management, backward compatibility, and the gap between "UI toggle" and "behavior change throughout the system."',
+      'Frontend-focused. Your source confirms toggle preference, class-based React without hooks, mock APIs for testing, and legal/branding requirements. War stories below are scenarios the design accounts for, not specific incidents to claim.',
     decisions: [
       {
         q: 'Force consolidated emails or give users a choice?',
         options: [
           'Force consolidated: simpler, ignores low-volume users.',
-          'Give users a choice with sensible default.',
+          'Give users a choice via toggle.',
         ],
         chosen: 'Give users a choice.',
-        why: 'Low-volume users with 2-3 reminders/week prefer per-transaction (forwardable, filable). High-volume users with 100+ need consolidation. One-size-fits-all loses one cohort.',
-        tradeoff: 'Two code paths. Mitigated by mode-aware shared components, not duplicated logic.',
+        why: 'Initial forced experience did not respect user preference and had legal/branding gaps. Toggle preserves user agency. Low-volume users prefer per-transaction; high-volume users want consolidation.',
+        tradeoff: 'Two code paths to support. Mitigated by refactoring shared components rather than duplicating logic.',
       },
       {
         q: 'Default mode — preserve old behavior or default to new?',
         options: [
-          'Default to consolidated (new): faster adoption, surprises existing users.',
-          'Default to per-transaction (old): preserves expectations, slower adoption.',
+          'Default to consolidated (new).',
+          'Default to per-transaction (preserve existing behavior).',
         ],
-        chosen: 'Default to per-transaction (preserve old).',
-        why: 'Existing users built workflows around per-transaction. Changing default silently = trust erosion. Surface the toggle prominently; let users opt-in.',
-        tradeoff: 'Slower adoption metric. Acceptable: backward compatibility > adoption pace for trust-sensitive features.',
+        chosen: 'Preserve existing behavior; consolidation is opt-in.',
+        why: 'Existing workflows must continue to function without surprise. Backward compatibility is the non-negotiable design constraint.',
+        tradeoff: 'Slower adoption pace. Acceptable for trust-sensitive notifications.',
       },
       {
-        q: 'Refactor shared components vs duplicate logic?',
+        q: 'Refactor shared components or duplicate logic per mode?',
         options: [
-          'Duplicate: faster, code rot guaranteed.',
-          'Refactor shared components with mode-aware props.',
+          'Duplicate: faster, future code rot.',
+          'Refactor shared components.',
         ],
         chosen: 'Refactor.',
-        why: 'Class-based React (no hooks) makes refactoring risky but not impossible. Mode-aware props prevent two divergent codebases. Pays back the first time a third email mode is considered.',
-        tradeoff: 'Refactor work carries regression risk. Mitigated by mock-API testing and unit coverage.',
+        why: 'Per your source: "We avoided branching logic explosion by refactoring shared components to support both modes cleanly." Class-based React without hooks made refactoring careful but not impossible.',
+        tradeoff: 'Refactor work carries regression risk in legacy codebase. Mitigated by mock APIs + unit/integration test coverage.',
+      },
+      {
+        q: 'Frontend testing without backend readiness?',
+        options: [
+          'Wait for backend.',
+          'Build with mocked services to decouple delivery.',
+        ],
+        chosen: 'Mock APIs.',
+        why: 'Per your source: "I used mocked services to decouple frontend delivery from backend readiness, which kept the release on schedule."',
+        tradeoff: 'Mock divergence risk if not maintained. Mitigated by treating contract as the source of truth and updating both.',
       },
     ],
     algorithms: [
       {
-        name: 'Mode-aware shared component',
-        description: 'Email composition accepts mode prop ("per-transaction" | "consolidated"). Internal logic branches: content template, recipient list, CTA wording. Shared CC/BCC, freeform body, attachment handling.',
-        complexity: 'O(1) mode check per render.',
-        why: 'Two delivery modes share 80% of UX. Mode-aware prop keeps 80% common + 20% specialized. Adding third mode = extend enum + add branch.',
-      },
-      {
-        name: 'Preference resolution at send time',
-        description: 'User preference stored at workflow level, fetched on execution. Email generator dispatches to per-txn or consolidated path based on resolved preference. Preference change applies to future workflows, not in-flight.',
-        complexity: 'O(1) preference lookup.',
-        why: 'Mid-workflow mode changes would cause inconsistent delivery. Preference resolved at execution time, not toggle time, keeps each workflow self-consistent.',
+        name: 'Mode-aware shared component pattern',
+        description:
+          'Email composition components accept mode prop ("per-transaction" | "consolidated"). Branching inside the component handles content template, recipient list, CTA differences. CC/BCC, freeform body, and attachments handled in shared code paths.',
+        complexity: 'O(1) mode branching per render.',
+        why: 'Two delivery modes share most UX. Mode-aware prop pattern keeps shared parts shared and specialized parts isolated. Extending to a third mode = add enum value + add branch.',
       },
     ],
     numbers: [
-      { metric: 'Email volume reduction', value: '65%', note: 'Measured pre vs post-launch in tenants with high-volume reminder workflows.' },
-      { metric: 'CSAT increase', value: '~40%', note: 'Survey-based, post-launch cohort.' },
-      { metric: 'Backward compatibility', value: '100%', note: 'No existing workflows broken; default preserves old behavior.' },
+      { metric: 'Email volume reduction', value: '65%', note: 'Per resume claim; aggregated reduction for high-volume reminder workflows.' },
+      { metric: 'CSAT increase', value: '~40%', note: 'Post-launch survey.' },
+      { metric: 'Backward compatibility', value: 'Preserved', note: 'Existing reminder workflows unchanged by default.' },
+      { metric: 'Codebase characteristic', value: 'Class-based React (no hooks)', note: 'Lifecycle methods + refactoring without destabilizing shared components.' },
     ],
     warStories: [
       {
-        scenario: 'Class-based React refactor scare',
-        whatHappened: 'Codebase had no hooks. Initial refactor of shared email components broke a sibling feature (CC/BCC) in unrelated workflow.',
-        howResolved: 'Reverted, narrowed refactor scope, added mock-API integration tests for sibling feature, re-applied. Lesson: refactor blast radius is larger than appears in legacy.',
-        lesson: 'In legacy React (or any legacy codebase), shared components have unwritten contracts. Test the contracts before changing implementation.',
+        scenario: 'Refactor risk in class-based React without hooks',
+        whatHappened:
+          'Documented design challenge: introducing extensibility in a class-based React codebase without destabilizing shared components. Sibling features (CC/BCC, freeform body) live in the same shared surface.',
+        howResolved:
+          'Per your source: "We avoided branching logic explosion by refactoring shared components to support both modes cleanly." Mock APIs for testing kept delivery independent of backend readiness. Unit and integration coverage documented.',
+        lesson:
+          'Legacy frontend codebases have unwritten contracts between sibling features. Test those contracts before changing the implementation underneath them.',
       },
       {
-        scenario: 'Legal content gate before merge',
-        whatHappened: 'Consolidated email template needed legal sign-off (branding + compliance). Initial template missed a required disclaimer. Caught in legal review.',
-        howResolved: 'Disclaimer added. Legal-review checkpoint established as part of email-template merge.',
-        lesson: 'Customer-facing communication is a legal artifact. Build review into merge, not as afterthought.',
+        scenario: 'Legal and branding requirements',
+        whatHappened:
+          'Per your source: "Email content changes were legally sensitive, so correctness mattered more than speed." Consolidated email content needed to meet updated legal and branding requirements.',
+        howResolved:
+          'Coordinated with design and legal during content rework. Compliance treated as gate, not afterthought.',
+        lesson:
+          'Customer-facing communications are legal artifacts. Compliance review is part of the merge gate, not a post-merge check.',
       },
     ],
     edgeCases: [
-      { case: 'User toggles mode mid-workflow', handling: 'Preference resolved at workflow execution. Mid-toggle does not affect in-flight reminders. Applies to next run.' },
-      { case: 'Mixed-mode workflows in one tenant', handling: 'Mode is per-workflow, not per-tenant. User can have some consolidated, others per-transaction. UI surfaces toggle per workflow.' },
-      { case: 'CC/BCC on consolidated email', handling: 'Preserved across both modes. CC/BCC composition is shared, not mode-specific.' },
+      { case: 'User toggles mode mid-workflow', handling: 'Preference applies to future workflow execution, not in-flight email generation.' },
+      { case: 'CC/BCC across modes', handling: 'CC/BCC composition shared, preserved across both modes.' },
+      { case: 'Freeform email body', handling: 'Preserved across both modes; not mode-specific.' },
+      { case: 'Backward compatibility for existing reminder workflows', handling: 'Default per-transaction behavior preserved. No silent migration.' },
     ],
     whatIWouldChange:
-      '(1) Hooks migration first, then refactor. Class-based refactor was twice the work. (2) Mode as string enum from day one to enable future modes (weekly digest, on-failure-only). (3) Email template versioning — legal updates should be diffable.',
+      'Retrospective opinion only. Possibilities: mode as a string enum from day one to enable future modes (e.g., weekly digest); template versioning so legal updates are diffable. Verify before claiming.',
     chains: [
       {
         title: 'The backward-compatibility chain',
         steps: [
-          { q: 'How did you ensure the toggle didn\'t break existing workflows?', a: 'Default preserved old behavior. Toggle opt-in. Shared components mode-aware via props, not new code paths. Existing tests passed unchanged.' },
-          { q: 'What if a user hand-customized their reminder template?', a: 'Templates preserved per workflow. Mode toggle doesn\'t overwrite customization. Customizations apply within resolved mode.' },
-          { q: 'What\'s the upgrade path for a third mode?', a: 'Mode enum extends. Shared components add a branch. Default unchanged.' },
+          { q: 'How did you ensure the toggle did not break existing workflows?', a: 'Default preserved old behavior. Toggle is opt-in. Shared components are mode-aware via props, not via duplicate code paths.' },
+          { q: 'What if a user has hand-customized their template?', a: 'Templates persist per workflow. Mode toggle does not overwrite customization; customizations apply within the resolved mode.' },
+          { q: 'How would a third mode be added?', a: 'Extend the enum. Add one branch in the shared components. Existing modes unaffected.' },
+        ],
+      },
+      {
+        title: 'The frontend-delivery chain',
+        steps: [
+          { q: 'How did you ship without waiting for backend?', a: 'Mocked services let the frontend develop and test against contracts. Backend readiness was decoupled from frontend release schedule.' },
+          { q: 'How did you handle legal review?', a: 'Treated content changes as a legal gate. Legal sign-off required before merging template changes.' },
+          { q: 'How did you preserve CC/BCC and freeform body?', a: 'These are shared across both modes via the refactored shared components, not duplicated per mode.' },
         ],
       },
     ],
   },
   'implicit-ads': {
     framing:
-      'A research/academic project. Useful for analytical depth, not core strength. Keep answers honest and tight.',
+      'Academic/research project. Useful for analytical depth, not core strength. Keep answers honest and tight. I do not have detailed source material on specific algorithms used — claims below are conservative; verify specifics before claiming.',
     decisions: [
       {
         q: 'Whole-video vs segment-level classification?',
         options: [
-          'Whole-video binary classifier: useless for actual product use.',
-          'Fixed-time-window segmentation: arbitrary boundaries, splits semantic units.',
-          'Audio-sentence-boundary segmentation: semantically meaningful units.',
+          'Whole-video binary: useless for actual product use.',
+          'Segment-level: enables boundary detection within otherwise-normal content.',
         ],
-        chosen: 'Audio-sentence-boundary segmentation.',
-        why: 'Implicit ads are embedded segments inside otherwise-normal content. Whole-video loses locality. Fixed windows split sentences mid-thought. Audio sentence boundaries align with semantic units.',
-        tradeoff: 'Requires audio-quality input. Failure on videos with continuous music or unclear speech. Acceptable for use case.',
+        chosen: 'Segment-level.',
+        why: 'Implicit ads are embedded inside otherwise-normal content. A 10-min video with a 30-sec embedded ad looks like non-ad at whole-video granularity. Segment level enables localization.',
+        tradeoff: 'Requires reliable segmentation logic. Failure on continuous-audio content.',
       },
       {
-        q: 'Single-modality (vision) or multi-modal?',
+        q: 'Single-modality or multi-modal classification?',
         options: [
-          'Vision-only: fails when ads look visually like main content.',
-          'Audio-only: fails when ads sound like main content.',
-          'Multi-modal fusion.',
+          'Vision-only or audio-only: each fails when ads mimic the other modality.',
+          'Multi-modal fusion across audio + visual + contextual signals.',
         ],
         chosen: 'Multi-modal.',
-        why: 'Implicit ads are defined by intent, not any single modality. Visual signals (logos, products), audio signals (brand mentions, CTA urgency), contextual signals (promotional phrasing) all weakly indicate ad intent. Fusion stronger than any single.',
-        tradeoff: 'Higher inference cost. Acceptable for offline batch use case.',
+        why: 'Implicit ads are defined by intent, not any single modality. Visual signals (logos, products), audio signals (brand mentions, CTA urgency), and contextual signals (promotional phrasing) all weakly indicate intent. Combined signal is stronger than any one.',
+        tradeoff: 'Higher inference cost. Acceptable for the offline batch use case.',
+      },
+      {
+        q: 'Optimize for precision or recall on the ad class?',
+        options: [
+          'Precision: fewer false positives, more false negatives.',
+          'Recall: fewer false negatives, more false positives.',
+        ],
+        chosen: 'Recall.',
+        why: 'Per your prep guide: "Missing an ad segment is worse than occasionally flagging non-ad content in moderation use cases." Moderation reviews can filter out false positives; missed ads cannot be recovered.',
+        tradeoff: 'More flagged content to review. Operationally acceptable.',
       },
     ],
     algorithms: [
       {
-        name: 'Audio sentence-boundary segmentation',
-        description: 'Extract audio, run voice activity detection + pause analysis to find sentence boundaries. Each segment ≈ one semantic unit.',
-        complexity: 'O(video duration).',
-        why: 'Semantic units are the right classification granularity for embedded content.',
-      },
-      {
-        name: 'CNN visual feature extraction',
-        description: 'Sample frames per segment, extract features via pre-trained CNN. Logo presence, product imagery patterns, branding-heavy frames.',
-        complexity: 'O(frames × CNN forward pass).',
-        why: 'Hand-engineering visual features for implicit ads is brittle. Pre-trained CNN gives transferable representation.',
-      },
-      {
-        name: 'Multi-modal fusion before final classification',
-        description: 'Visual features (CNN) + audio features (MFCC, prosody) + contextual features (CTA phrasing, brand mentions from transcripts) concatenated and fed to final classifier.',
-        complexity: 'O(feature dim) per segment.',
-        why: 'Late fusion is simpler than early fusion and lets each modality\'s feature extractor be tuned independently.',
+        name: 'Multi-modal feature combination',
+        description:
+          'Audio, visual, and contextual signals extracted per segment and combined for final classification. Specifics of architecture and feature engineering withheld here — verify from your own notes before claiming exact components.',
+        complexity: 'Depends on per-modality model choice.',
+        why: 'No single modality is reliable for implicit-ad detection. Combining weak signals across modalities improves discrimination.',
       },
     ],
     numbers: [
-      { metric: 'Accuracy', value: '~85%', note: 'On the labeled test set.' },
-      { metric: 'Recall (ad class)', value: 'High', note: 'Prioritized over precision — false negatives hurt moderation more than false positives.' },
-      { metric: 'Inference latency', value: 'Near real-time', note: 'For offline batch; not optimized for live streaming.' },
-    ],
-    warStories: [
-      {
-        scenario: 'False positives on product reviews',
-        whatHappened: 'Initial model flagged genuine product reviews as ads. Brand mentions + visual products scored high without promotional intent.',
-        howResolved: 'Weighted contextual signals (CTA phrasing, urgency) higher. Product review pattern (extended discussion, neutral tone) became negative evidence.',
-        lesson: 'Intent is the signal, not brand presence. Feature engineering must reflect intent, not just keywords.',
-      },
+      { metric: 'Accuracy', value: '~85%', note: 'On the labeled test set per resume.' },
+      { metric: 'Recall priority', value: 'High over precision', note: 'Moderation use case: false negatives more costly than false positives.' },
+      { metric: 'Classification granularity', value: 'Segment-level', note: 'Not whole-video; enables localization.' },
     ],
     edgeCases: [
-      { case: 'Videos with continuous background music', handling: 'Audio sentence-boundary detection degrades. Fallback to fixed-time-window with reduced confidence.' },
-      { case: 'Multi-language content', handling: 'Out of scope V1 — English only. Multi-language would need localized brand dictionaries and language-specific CTA patterns.' },
+      { case: 'Continuous-audio content (music videos, podcasts)', handling: 'Sentence-boundary segmentation degrades. Fallback to fixed-time-window with reduced confidence.' },
+      { case: 'Multi-language content', handling: 'V1 scope was a single language. Multi-language would require localized brand dictionaries and language-specific CTA patterns.' },
+      { case: 'Genuine product reviews flagged as ads', handling: 'Documented failure class. Mitigated by weighting promotional-intent signals (CTA phrasing, urgency) over brand-presence alone. Intent is the signal, not brand mention.' },
     ],
     whatIWouldChange:
-      'Build confidence-banded output (high/medium/low) instead of binary — fits moderation workflows better. Add human-in-the-loop review for medium-confidence. Use transformer for cross-modal fusion instead of late concatenation.',
+      'Retrospective opinion only. Possibilities: confidence-banded output (high/medium/low) for moderation triage; human-in-the-loop review for medium-confidence segments. Verify before claiming.',
     chains: [
       {
-        title: 'The segmentation chain',
+        title: 'The problem-formulation chain',
         steps: [
-          { q: 'Why segment-level not whole-video?', a: 'Whole-video loses locality. A 10-min video with 30-sec ad looks like non-ad. Segment level enables boundary detection.' },
-          { q: 'Why audio-sentence boundaries not fixed windows?', a: 'Fixed windows split sentences. Sentence boundaries align with semantic units, giving more coherent classification context.' },
-          { q: 'What if audio is unclear?', a: 'Fallback to fixed-time windows with lower confidence weighting. Documented limitation.' },
+          { q: 'Why segment-level instead of whole-video?', a: 'Implicit ads are embedded within otherwise-normal content. Whole-video loses locality and conflates ad and non-ad signals.' },
+          { q: 'Why multi-modal?', a: 'Intent is the signal, not brand presence. No single modality reliably captures intent. Multi-modal combines weak signals.' },
+          { q: 'Why optimize for recall?', a: 'In moderation, a missed ad cannot be recovered. False positives can be filtered by review. Recall priority follows from the use case.' },
+          { q: 'What is the hardest part of this problem?', a: 'Implicit ads do not look like ads. There is no clean visual boundary or audio spike. The only reliable signal is intent — which forces semantic segmentation and weak-signal fusion.' },
         ],
       },
     ],
